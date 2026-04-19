@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use late_core::models::leaderboard::LeaderboardData;
+use late_core::models::profile::Profile;
 
 use crate::{
     app::{
@@ -23,11 +24,13 @@ use crate::{
         chat::notifications::svc::NotificationService,
         chat::svc::ChatService,
         common::primitives::{Banner, Screen},
-        profile,
+        help_modal, profile,
         profile::svc::ProfileService,
+        profile_modal,
         visualizer::Visualizer,
         vote,
         vote::svc::{Genre, VoteService},
+        welcome_modal,
     },
     session::{
         ClientAudioState, PairControlMessage, PairedClientRegistry, SessionMessage, SessionRegistry,
@@ -35,6 +38,43 @@ use crate::{
     state::{ActiveUsers, ActivityEvent},
     web::WebChatRegistry,
 };
+
+/// Which desktop-notification OSC sequence(s) to emit. Defaults to `Both`
+/// until the client answers an XTVERSION probe with a known terminal name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NotificationMode {
+    Both,
+    Osc777,
+    Osc9,
+}
+
+/// Map an XTVERSION payload (the bytes between `ESC P > |` and `ESC \`,
+/// e.g. `kitty(0.31.0)`) to the preferred notification mode. Returns
+/// `None` when the terminal is unknown, so callers leave the session on
+/// `Both`.
+pub(crate) fn notification_mode_for_terminal(payload: &str) -> Option<NotificationMode> {
+    let name_end = payload.find('(').unwrap_or(payload.len());
+    let name = payload[..name_end].trim();
+
+    // Case-insensitive match so e.g. `WezTerm` and `wezterm` both hit.
+    // Prefixes keep us working across version suffixes and minor rebrands.
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("iterm2") {
+        Some(NotificationMode::Osc9)
+    } else if lower.starts_with("kitty")
+        || lower.starts_with("wezterm")
+        || lower.starts_with("ghostty")
+        || lower.starts_with("foot")
+        || lower.starts_with("konsole")
+        || lower.starts_with("rxvt-unicode")
+        || lower.starts_with("urxvt")
+        || lower.starts_with("mlterm")
+    {
+        Some(NotificationMode::Osc777)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Default)]
 pub(super) struct SharedBuffer {
@@ -136,7 +176,8 @@ pub struct App {
     pub(crate) splash_ticks: usize,
     pub(crate) splash_hint: String,
     pub(crate) show_help: bool,
-    pub(crate) help_scroll: u16,
+    pub(crate) show_profile_modal: bool,
+    pub(crate) help_modal_state: help_modal::state::HelpModalState,
     pub(crate) pending_escape: bool,
     pub(crate) pending_escape_started_at: Option<Instant>,
     pub(crate) vt_input: crate::app::input::VtInputParser,
@@ -174,6 +215,8 @@ pub struct App {
 
     /// Profile
     pub(crate) profile_state: profile::state::ProfileState,
+    pub(crate) profile_modal_state: profile_modal::state::ProfileModalState,
+    pub(crate) welcome_modal_state: welcome_modal::state::WelcomeModalState,
 
     /// Leaderboard
     pub(super) leaderboard_rx: Option<watch::Receiver<Arc<LeaderboardData>>>,
@@ -207,6 +250,11 @@ pub struct App {
 
     /// Last background color sent to the terminal via OSC 11 (if any).
     pub(crate) last_terminal_bg: Option<ratatui::style::Color>,
+
+    /// Which OSC sequence(s) to emit for desktop notifications. Starts at
+    /// `Both` and narrows when an XTVERSION (`CSI > q`) reply identifies
+    /// the client terminal. See `set_terminal_version`.
+    pub(crate) notification_mode: NotificationMode,
 
     /// Server state
     pub(crate) is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -350,6 +398,15 @@ impl App {
 
         let active_users = config.active_users.clone();
         let splash_hint = super::common::splash_tips::choose_splash_hint(config.is_new_user);
+        let initial_profile = Profile {
+            theme_id: Some(config.initial_theme_id.clone()),
+            ..Profile::default()
+        };
+        let mut welcome_modal_state = welcome_modal::state::WelcomeModalState::new(
+            config.profile_service.clone(),
+            config.user_id,
+        );
+        welcome_modal_state.open_from_profile(&initial_profile, welcome_modal::ui::MODAL_WIDTH);
 
         Ok(Self {
             running: true,
@@ -361,7 +418,8 @@ impl App {
             splash_ticks: 0,
             splash_hint,
             show_help: false,
-            help_scroll: 0,
+            show_profile_modal: false,
+            help_modal_state: help_modal::state::HelpModalState::new(),
             pending_escape: false,
             pending_escape_started_at: None,
             vt_input: crate::app::input::VtInputParser::default(),
@@ -396,11 +454,15 @@ impl App {
             dashboard_chat_rows_cache: chat::ui::ChatRowsCache::default(),
             active_room_rows_cache: chat::ui::ChatRowsCache::default(),
             profile_state: profile::state::ProfileState::new(
-                config.profile_service,
+                config.profile_service.clone(),
                 config.user_id,
                 config.ai_model,
                 config.initial_theme_id,
             ),
+            profile_modal_state: profile_modal::state::ProfileModalState::new(
+                config.profile_service.clone(),
+            ),
+            welcome_modal_state,
             leaderboard_rx: config.leaderboard_rx,
             leaderboard: Arc::new(LeaderboardData::default()),
             bonsai_state,
@@ -422,6 +484,7 @@ impl App {
             icon_picker_state: super::icon_picker::IconPickerState::default(),
             icon_catalog: None,
             last_terminal_bg: None,
+            notification_mode: NotificationMode::Both,
         })
     }
 
@@ -433,6 +496,27 @@ impl App {
 
     pub fn handle_input(&mut self, data: &[u8]) {
         crate::app::input::handle(self, data)
+    }
+
+    /// Called when an XTVERSION DCS reply has been parsed. `payload` is the
+    /// raw string between `ESC P > |` and `ESC \`, e.g. `kitty(0.31.0)`.
+    pub(crate) fn set_terminal_version(&mut self, payload: &str) {
+        match notification_mode_for_terminal(payload) {
+            Some(mode) => {
+                tracing::info!(
+                    payload,
+                    ?mode,
+                    "narrowed notification mode from XTVERSION reply"
+                );
+                self.notification_mode = mode;
+            }
+            None => {
+                tracing::info!(
+                    payload,
+                    "unknown terminal from XTVERSION reply; staying on Both"
+                );
+            }
+        }
     }
 
     pub fn toggle_paired_client_mute(&mut self) -> bool {
@@ -482,8 +566,11 @@ impl App {
         // 1000h = basic mouse tracking (button press/release + scroll wheel)
         // 1006h = SGR extended encoding (ESC[< sequences instead of legacy X11)
         // 2004h = bracketed paste mode (ESC[200~ ... ESC[201~)
-        // OSC 11 = set background to black
-        buf.extend_from_slice(b"\x1b[?1000h\x1b[?1006h\x1b[?2004h");
+        // CSI > q = XTVERSION query. Reply is a DCS sequence
+        // (`ESC P > | <name>(<version>) ESC \`) parsed in input.rs; the
+        // session starts in NotificationMode::Both and narrows once it
+        // arrives. Terminals that don't implement XTVERSION stay on Both.
+        buf.extend_from_slice(b"\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[>q");
         buf
     }
 
@@ -561,5 +648,41 @@ mod tests {
     fn shared_buffer_default_is_empty() {
         let buf = SharedBuffer::default();
         assert!(buf.take().is_empty());
+    }
+
+    #[test]
+    fn notification_mode_for_terminal_maps_known_terminals() {
+        assert_eq!(
+            notification_mode_for_terminal("kitty(0.31.0)"),
+            Some(NotificationMode::Osc777)
+        );
+        assert_eq!(
+            notification_mode_for_terminal("WezTerm(20240127)"),
+            Some(NotificationMode::Osc777)
+        );
+        assert_eq!(
+            notification_mode_for_terminal("ghostty(1.0.0)"),
+            Some(NotificationMode::Osc777)
+        );
+        assert_eq!(
+            notification_mode_for_terminal("iTerm2(3.5.0)"),
+            Some(NotificationMode::Osc9)
+        );
+    }
+
+    #[test]
+    fn notification_mode_for_terminal_unknown_returns_none() {
+        assert_eq!(notification_mode_for_terminal("xterm(390)"), None);
+        assert_eq!(notification_mode_for_terminal(""), None);
+        assert_eq!(notification_mode_for_terminal("something-weird"), None);
+    }
+
+    #[test]
+    fn enter_alt_screen_includes_xtversion_probe() {
+        let bytes = App::enter_alt_screen();
+        assert!(
+            bytes.windows(4).any(|w| w == b"\x1b[>q"),
+            "expected CSI > q in startup bytes, got: {bytes:?}"
+        );
     }
 }

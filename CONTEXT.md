@@ -3,7 +3,7 @@
 ## Metadata
 - Domain: late.sh - Terminal Clubhouse for Developers
 - Primary audience: LLM agents working on this codebase, human contributors
-- Last updated: 2026-04-16 (chat room rail now has `Space` jump mode: pressing `Space` overlays single-key letter/digit hints beside rooms, `Esc`/`Space` cancels, and the next hint key jumps directly to that room; generic chat overlays now size height from wrapped visual rows, so long `/music` help lines fit without clipping; `/music` now opens the same scrollable overlay flow as `/help` instead of posting to chat; `?` help overlay Chat section lists `/music`; user-selectable SSH themes added with persisted `users.settings.theme_id`; built-in palettes now include default `late`, `contrast`, and opacity-friendly `purple`; profile settings gained a Theme selector; dashboard Stream card trimmed to 3 rows (now playing, vibe, `/music` hint) - CLI/browser URLs removed; sidebar Now Playing merged paired client info into one line (8->7 rows); visualizer empty state shows `/music` hint; QR modal shows URL as fallback text; chat pairing tokens switched to compact base64url (22 chars, same as session tokens); splash tips brighter)
+- Last updated: 2026-04-19
 - Status: Active
 - Stability note: Sections marked `[STABLE]` should change rarely. Sections marked `[VOLATILE]` are expected to change often.
 
@@ -257,7 +257,65 @@ To maintain a buttery-smooth 15-60 FPS over SSH, the architecture strictly separ
 5. **The User Action (`app/input.rs`)**
    Input handlers modify the synchronous UI State (like moving cursors). When an action requires I/O (like hitting `Enter` to save), the input handler fires a fire-and-forget method on the Service. The Service spawns a Tokio task to do the DB/API work, pushes the result to the channel, and the UI catches it on the next 66ms tick.
 
-### 2.6 Audio infrastructure
+### 2.6 Render loop timing (world tick + input-driven)
+
+Each SSH session spawns **one render task** (`late-ssh/src/ssh.rs`) with two independent trigger sources:
+
+- **World tick** — fires every `WORLD_TICK_INTERVAL` (66ms). Advances animations (`app.tick()`), renders, ships the frame. Floor cadence ≈ 15 FPS regardless of input.
+- **Input-driven render** — fires within `MIN_RENDER_GAP` (15ms) of any keystroke or terminal resize. Renders *without* advancing world time, so typed characters echo at near-native latency instead of waiting up to 66ms for the next world tick.
+
+The select loop picks which branch to act on:
+
+```mermaid
+flowchart TD
+    INPUT["data() / window_change_request()<br/>(keystroke, resize)"] -->|"set dirty=true<br/>(under app mutex)"| SIGNAL
+    SIGNAL["RenderSignal<br/>dirty: AtomicBool<br/>notify: tokio::Notify"] -->|"notify_one()<br/>(after mutex released)"| LOOP
+    WT["world_tick.tick()<br/>every 66ms"] --> LOOP
+    LOOP{"biased select!"}
+    LOOP -->|"world tick fired"| ADVANCE["advance_world=true<br/>render"]
+    LOOP -->|"input_pending &&<br/>gap elapsed"| RENDER["advance_world=false<br/>render"]
+    LOOP -->|"notify && dirty"| ARM["input_pending=true<br/>loop"]
+    LOOP -->|"notify && !dirty"| DROP["eat stale permit<br/>loop"]
+    ADVANCE --> CLEAR["clear dirty under mutex,<br/>app.tick() + app.render()"]
+    RENDER --> CLEAR
+    CLEAR --> LOOP
+```
+
+`biased` ordering ensures the world tick wins on ties so animations aren't starved under a keystroke flood. `next_render_action` is extracted as a standalone async fn so the decision logic is unit-testable without a full session.
+
+#### Timing example — typing burst
+
+```
+t=0     world tick fires → render, previous_render=0, dirty=false
+t=3     keystroke → dirty=true, notify_one (permit stored)
+t=3+    select: notify branch → dirty=true → input_pending=true, continue
+t=3+    select: sleep_until(0+15ms) armed, notify disabled
+t=8     keystroke → dirty=true (already), notify_one (permit stored, branch disabled)
+t=15    sleep_until fires → render covers BOTH keystrokes, dirty cleared
+t=15+   select: notify branch eats leftover permit → dirty=false → nothing
+t=66    world tick → render, animations advance
+```
+
+Two keystrokes → one render at t=15. No spurious trailing frame.
+
+#### Why `dirty` is separate from `Notify`
+
+`tokio::sync::Notify::notify_one()` stores **one** permit when no waiter is active. If `Notify` alone gated renders, permits left over from input already batched into an earlier render would fire an identical repeat frame one throttle window later. Two primitives, two jobs:
+
+- `Notify` — alarm clock. Wakes the task.
+- `dirty` — sticky note. Source of truth for "there is unrendered state".
+
+Both `dirty` writes (input path) and `dirty` clears (render path) happen under the same `TokioMutex<App>` that guards state mutations. Invariant: a render that acquires the mutex after an input either already covered it, or observes `dirty=true` and will cover it on the next iteration.
+
+The stored-permit regression is locked down by `ssh::tests::stale_permit_does_not_arm_throttle`; the surrounding tests cover throttle timing, `biased` wins, and the idle/active paths.
+
+#### Scope and constraints
+
+- **Throttle is per-session** — one session's flood can't affect another's cadence.
+- **Ceiling: ~67 renders/sec per session** (`1000 / MIN_RENDER_GAP_MS`) — above smoothness threshold, below CPU-DoS territory.
+- **Does not address lock contention** — the app mutex is still shared between `data()` and the render task; see §8.5 A. This change only closes the input-to-frame cadence gap, not the lock-held-across-tick stall.
+
+### 2.7 Audio infrastructure
 
 ```mermaid
 flowchart LR
@@ -334,7 +392,7 @@ Music binaries live in Cloudflare R2, synced to the Liquidsoap PVC during infra 
 
 Local playlist files retain full annotated metadata including duration (when present in ID3 tags). The `rewrite_np_metadata` function in `radio.liq` formats "now playing" as `Artist - Title | Duration` for the sidebar. Internet streams provided ICY metadata with no duration; local files may or may not have duration depending on the source.
 
-### 2.7 Nonogram Generation and Runtime Split
+### 2.8 Nonogram Generation and Runtime Split
 
 Nonograms intentionally use an offline generation pipeline instead of generating puzzles during SSH sessions.
 
@@ -356,20 +414,21 @@ Nonograms intentionally use an offline generation pipeline instead of generating
 Current invariant:
 - `late-ssh` is runtime-only for nonograms: read JSON assets, select a puzzle, render/play it, and persist per-user progress. Generation belongs in `late-core/src/bin/gen_nonograms.rs`, not in the SSH hot path.
 
-### 2.8 Local CLI MVP
+### 2.9 Local CLI MVP
 
 `late-cli/src/main.rs` is the standalone local launcher (companion CLI).
 
 1. **Standalone crate** — `late-cli` has zero dependency on `late-core`. `AnalyzerConfig` is inlined so the crate can be built independently.
 2. **Single-process audio path** — It opens the audio stream once, decodes MP3 locally with symphonia, feeds local playback via `cpal`, and derives visualizer/analyzer data from that same decoded stream. Native output sample rate is preferred; otherwise it chooses the nearest supported device rate and applies in-process linear resampling.
-3. **PTY + token handshake** — It launches the normal SSH TUI through a pty, intercepts a one-line `LATE_SESSION_TOKEN=<base64url-uuid-v7>` banner emitted only for `LATE_CLI_MODE=1` sessions, and keeps stdin blocked until that banner phase is complete so pre-handshake keystrokes do not leak into the app. The token is an unpadded URL-safe base64 encoding of the UUID bytes, which keeps QR/connect URLs shorter than canonical UUID text.
-4. **Identity + pairing** — Client identity remains SSH-key based, with an interactive fallback that can generate `~/.ssh/id_late_sh_ed25519` when no local key exists. The CLI then uses `/api/ws/pair` to forward analyzer frames, accept paired control commands, and report `client_state { client_kind, muted, volume_percent }`.
-5. **Distribution + platform notes** — The landing page advertises both `curl -fsSL https://cli.late.sh/install.sh | bash` and a source build path. CLI releases go through `deploy_cli`. The launcher is currently Unix-first (`ssh` + `cpal`), supports Linux/macOS/likely WSL, and surfaces targeted WSL audio hints by checking `DISPLAY`, `WAYLAND_DISPLAY`, and `PULSE_SERVER` when startup fails.
+3. **SSH transport modes** — `late-cli` now has a runtime transport switch, but native is the default. `--ssh-mode old` preserves the original OpenSSH-through-pty path, while `--ssh-mode native` uses an embedded `russh` client. The old path still intercepts the one-line `LATE_SESSION_TOKEN=<base64url-uuid-v7>` banner from the PTY stream. The native path now does a dedicated `late-cli-token-v1` SSH `exec` request on a separate session channel, expects JSON `{ "session_token": "..." }`, and then opens the real PTY shell channel with no banner parsing and no fallback. In both modes stdin stays blocked until the token phase completes so pre-handshake keystrokes do not leak into the app.
+4. **Identity + host trust + pairing** — Client identity remains SSH-key based, but the interactive fallback now generates `~/.ssh/id_late_sh_ed25519` natively instead of shelling out to `ssh-keygen`. Operators can override the key path with `--key` or `LATE_KEY_FILE`; if the file does not exist and the terminal is interactive, the CLI offers to generate the key at that exact path. `LATE_IDENTITY_FILE` is still accepted as a legacy env fallback. Native mode verifies server keys against `~/.ssh/known_hosts` and learns first-seen keys with accept-new semantics. The CLI then uses `/api/ws/pair` to forward analyzer frames, accept paired control commands, and report `client_state { client_kind, ssh_mode, platform, muted, volume_percent }`.
+5. **Distribution + platform notes** — The landing page advertises both `curl -fsSL https://cli.late.sh/install.sh | bash` and a source build path. CLI releases go through `deploy_cli`. Audio playback is still `cpal`-based and requires a working local output device. The launcher now has a native SSH path intended to remove the hard OpenSSH dependency over time; on Unix it forwards resize via `SIGWINCH`, and on non-Unix it polls terminal size changes and emits SSH `window-change` requests. Repo helper scripts now include native-mode bash launchers plus PowerShell equivalents for local/prod flows. WSL-specific audio hints still check `DISPLAY`, `WAYLAND_DISPLAY`, and `PULSE_SERVER`.
 
 Current invariants:
 - The installer defaults to `https://cli.late.sh`, and the CLI supports `-v` / `--verbose` for stderr debug logging.
 - Browser and CLI share the same paired-client protocol, so the TUI can show target kind plus live mute/volume state in the sidebar.
-- The CLI currently requires a working local audio output device to fully start; native Windows support would require replacing the external `ssh` launch path.
+- The CLI currently requires a working local audio output device to fully start.
+- Native SSH is now the default launcher path; `--ssh-mode old` remains the compatibility fallback. Native mode requires a server that supports the `late-cli-token-v1` SSH exec handshake.
 
 ---
 
@@ -410,7 +469,7 @@ late-sh/
 │   ├── assets/nonograms/       # Prebuilt puzzle packs
 │   └── tests/                  # Integration/smoke tests grouped by feature
 ├── late-cli/
-│   └── src/main.rs             # Standalone CLI: audio + analyzer + SSH + WS pairing
+│   └── src/                    # Standalone CLI: main + config, identity, raw_mode, pty, ssh, ws, audio/{decoder,resampler,output,decoder_thread,analyzer}
 ├── late-web/
 │   ├── src/
 │   │   ├── main.rs / lib.rs    # Web entrypoint + router
@@ -753,6 +812,7 @@ Currently the SSH app assumes a single process. These in-memory structures would
 - **SSH send failure is terminal for render task:** if `handle.data` returns `Err` (closed/broken channel), `render_once` now returns an error so the render loop stops and closes channel once, instead of logging warnings every 66ms forever
 - **Message ordering:** Full history is `ORDER BY created DESC, id DESC` (newest first), delta sync is `(created, id) > cursor ASC` - mixing these up breaks chat display. Chat rendering reverses messages to oldest-first for row-based display, with newest at the bottom.
 - **Chat message navigation is selection-first:** `selected_message_id` is the source of truth on both the dashboard general card and the chat screen (they share one storage). Mouse wheel, arrows, paging, and `j/k` all move selection; when no message is selected, the viewport falls back to newest-at-bottom.
+- **Chat display names are intentionally plain:** transcript author labels, DM labels, and member labels render the stored username without a leading `@` and without an appended country badge. `@` still exists in composer mentions, mention autocomplete, and command syntax (`/dm @user`, `/ignore @user`, etc.), so display formatting and mention syntax are deliberately different.
 - **Chat wrapping is word-aware:** Shared wrapping prefers breaking on whitespace for regular messages, reply quote lines, news-card text, and the composer. Hard splits are only valid for single words longer than the available width.
 - **Chat room list order is UI-defined:** The chat sidebar order is hardcoded as `core` (`general`, `announcements`, `suggestions`, any other permanent rooms, then synthetic `news`) → `public` → `private` → `dm`, with divider rows rendered in the UI. Here, "private" is a UI/product label for non-auto-join rooms (`auto_join = false`), not necessarily DB `visibility = 'private'`. The synthetic `news` row now carries its own unread badge sourced from `article_feed_reads`, not `chat_room_members`.
 - **Transcript render cost is cache-sensitive:** every member room keeps a warm tail (broadcast-driven, hard-capped at 1000 messages per room). The chat UI caches wrapped transcript rows for the dashboard general card and the active room; invalidation must track width, message content/order, usernames, badges, and bonsai glyphs. Only the selected room and general are fetched from DB on snapshot refresh — other rooms warm up from broadcasts and pull a one-shot backfill via `request_list` on first open per session.
@@ -770,7 +830,7 @@ Currently the SSH app assumes a single process. These in-memory structures would
 - **Web/CLI Audio and WS Resiliency:** Both paired clients use a 10-attempt retry loop (2s delay) for WebSocket disconnections and audio stream failures. Web Audio reconstructs elements with cache-busting `?t=` URLs, and CLI re-probes `SymphoniaStreamDecoder` in place, so both recover seamlessly from `ERR_NETWORK_CHANGED` without dropping the session.
 - **Browser and CLI viz payloads share schema, not implementation:** Both paired clients send `{ event: "viz", position_ms, bands, rms }`, but the browser uses Web Audio `AnalyserNode` while the CLI uses an in-process Rust FFT over playback samples. Expect similar behavior, not identical numbers.
 - **CLI binary must forward local terminal resizes:** The `late` binary runs SSH inside a local PTY and must propagate `SIGWINCH` size changes into that PTY so side-by-side panes and split windows reflow correctly after startup.
-- **CLI must suppress pre-banner input:** The local `late` binary must not forward stdin into the SSH PTY until the server's `LATE_SESSION_TOKEN=` banner has been captured. Any keys typed during handshake/welcome race windows are intentionally discarded, and pending terminal input is flushed immediately before forwarding starts.
+- **CLI must suppress pre-token input:** The local `late` binary must not forward stdin into the interactive SSH PTY until the pairing token exchange has completed. In subprocess mode that still means waiting for the server's `LATE_SESSION_TOKEN=` banner; in native mode it means waiting for the dedicated `late-cli-token-v1` SSH exec handshake response. Any keys typed during handshake/welcome race windows are intentionally discarded, and pending terminal input is flushed immediately before forwarding starts.
 - **Activity feed broadcast timing:** `broadcast::Receiver` only sees messages sent AFTER subscription. The receiver must be created in `auth_publickey` (before login event is sent), stored on `ClientHandler`, then `.take()`'d into `SessionConfig` in `pty_request`. Creating the receiver later misses the user's own login event.
 - **Leaderboard refresh is async, badges are eventually consistent:** `LeaderboardService` refreshes every 30s. A new daily win won't appear in the leaderboard or chat badges until the next refresh cycle. Activity feed callouts are immediate (fire-and-forget from `record_win_task`).
 - **Streak SQL uses gaps-and-islands:** A streak is "current" if its last day is today or yesterday. This means a user who hasn't played today still keeps their streak visible until midnight UTC tomorrow. The `UNION` across `sudoku_daily_wins` and `nonogram_daily_wins` deduplicates dates so playing both games on the same day counts as one streak day.
@@ -780,10 +840,66 @@ Currently the SSH app assumes a single process. These in-memory structures would
 - **Bonsai chat glyph is current-user only:** The bonsai stage glyph (· ⚘ 🌲 🌳 🌸) is only shown next to the current user's own messages. Other users' bonsai stages are not queried or displayed in chat (would require a new cross-user lookup).
 - **Bonsai cut changes seed optimistically:** The `cut()` method updates `self.seed` in memory immediately and fires a background DB task. If the DB write fails, the in-memory seed diverges from persisted until next login.
 - **Help modal (`?`) intercepts all input:** When `show_help` is true, the input handler dismisses the modal on any keypress before any other input processing. This includes `?` itself (toggle off) and `Esc`.
-- **Desktop notifications bypass the frame diff:** OSC 777 (kitty/Ghostty/rxvt-unicode/foot/wezterm/konsole) and OSC 9 (iTerm2 fallback) payloads are written to `App::pending_terminal_commands`, not into the ratatui frame. `late-ssh::ssh::render_once` drains that buffer **after** pushing the frame diff and sends each payload as a separate `handle.data` call. Writing them inline with `write!(self.shared, …)` would slip them into the diff and get re-emitted on every redraw. Same rule applies to OSC 52 clipboard copies.
+- **Desktop notifications bypass the frame diff:** OSC 777 (kitty/Ghostty/rxvt-unicode/foot/wezterm/konsole/mlterm) and OSC 9 (iTerm2) payloads are written to `App::pending_terminal_commands`, not into the ratatui frame. `late-ssh::ssh::render_once` drains that buffer **after** pushing the frame diff and sends each payload as a separate `handle.data` call. Writing them inline with `write!(self.shared, …)` would slip them into the diff and get re-emitted on every redraw. Same rule applies to OSC 52 clipboard copies. The session emits an XTVERSION probe (`CSI > q`) alongside the other alt-screen setup bytes and narrows `App::notification_mode` (`Both` → `Osc777` | `Osc9`) from the DCS reply (`ESC P > | <name>(<version>) ST`) — kitty/wezterm/ghostty/foot/konsole/rxvt-unicode/mlterm land on `Osc777`, iTerm2 on `Osc9`, and unknown/non-responding terminals stay on `Both` (prior behavior). Replies are spliced out of the raw byte stream **before** the splash short-circuit so the leading `ESC` doesn't dismiss the splash (`input::extract_xtversion_replies`); the `vte::Parser` DCS path (`hook`/`put`/`unhook`) catches the same reply again after splash and `App::set_terminal_version` is idempotent, so the double-path is intentional.
 - **Notification pipeline is kind-tagged and throttled server-side:** `ChatState::pending_notifications` holds `PendingNotification { kind: &'static str, title, body }` entries drained each render. `render.rs` picks the first pending whose `kind` is in `users.settings.notify_kinds` and honors the shared `notify_cooldown_mins` via `App::last_notify_at`. Adding a new kind means: (1) append to `ProfileState::NOTIFY_KINDS`, (2) add a row in `profile/ui.rs` `kinds` tuple, (3) enqueue it from the relevant event handler, (4) update the unit test `notify_kinds_constant_matches_ui_expectations` in `profile/state.rs`. No tmux DCS wrapping — tmux is explicitly unsupported.
 - **Profile notifications default to all-off:** Migration 026 merges profile fields into `users.settings` with `notify_kinds = []` and `notify_cooldown_mins = 0`. `render.rs` only fires if the kind string is present in the user's array, so a brand-new account is silent until they opt in on the profile screen. A focus-tracking `"unfocused"` policy used to exist (DEC mode 1004) but was removed — `notify_kinds` is the whole model now.
 - **`Profile` is a view, not a table:** Migration 026 dropped the `profiles` table — username + notify settings + theme now live on `users` (column + `settings` JSONB). `late_core::models::profile::Profile` is a projection loaded via `Profile::load(client, user_id)` and saved via `Profile::update(client, user_id, params)`, which merges into `settings` with `settings || jsonb_build_object(...)` to preserve unrelated keys (theme_id, ignored_user_ids) under concurrent writes.
+
+---
+
+## 8.5 Input Lag Investigation (~60 concurrent users) [VOLATILE]
+
+Symptom observed at ~60 concurrent SSH sessions: noticeable input lag in the TUI (chat composer, screen switches). Findings from two independent code reads, grouped and deduplicated below. Ordered by likely impact. None of these have been fixed yet — keep this list current as work lands.
+
+### A. Render lock blocks input (partially addressed)
+- The SSH `data` handler and the render task both take the same `TokioMutex<App>` (see `late-ssh/src/ssh.rs`).
+- `render_once` holds the lock across the whole synchronous `app.tick()` + `app.render()` (full ratatui draw + diff). The lock is only released before `handle.data(...)` is awaited, so any single expensive frame stalls every keystroke that arrives during it.
+- With 60 sessions × 15 FPS = ~900 frame builds/sec sharing tokio worker threads, even modestly expensive frames push input latency into the felt range.
+- **Cadence gap closed (§2.6):** the render loop now wakes on input via `RenderSignal` within ~15ms instead of waiting up to 66ms for the next world tick. This removes the "input lands right after a world tick → 60ms dead zone" case entirely. Typical input-to-frame latency is now bounded by the mutex contention tail, not the world-tick cadence.
+- **Still open — lock contention:** `data()` still awaits the app mutex. A slow render on another task will block input. Further fix (not yet done): `data()` pushes raw bytes into a per-session `mpsc::UnboundedSender<Vec<u8>>`; the render task drains it at the top of each tick. Input never blocks on the render lock again.
+
+### B. Chat row cache is expensive even on hits
+- `ensure_chat_rows_cache` (`late-ssh/src/app/chat/ui.rs:324`) calls `chat_rows_fingerprint` (`late-ssh/src/app/chat/ui.rs:297`) every render. The fingerprint hashes message id, user_id, created, **body string**, plus username/badge/glyph lookups for every visible message.
+- With `HISTORY_LIMIT = 1000` (`late-ssh/src/app/chat/svc.rs:22`), the active room's full transcript can be re-hashed up to 15 times/sec per session — a steady CPU floor even when nothing changed.
+- **Direction:** cap visible messages much lower (200 is plenty for a TUI viewport), and/or maintain the fingerprint incrementally (`(last_msg_id, last_msg_updated_at, len, badge_version, glyph_version)`) instead of full re-hash.
+
+### C. `ChatSnapshot` is a single global watch channel + per-user payload → quadratic clone storm
+- `ChatService` holds **one** `watch::Sender<ChatSnapshot>` (`late-ssh/src/app/chat/svc.rs:155`). Every session's refresh task publishes its own per-user snapshot into it (`late-ssh/src/app/chat/svc.rs:240`), ~6 publishes/sec at 60 users.
+- `drain_snapshot` (`late-ssh/src/app/chat/state.rs:1128`) clones the **entire** snapshot first, then discards it if `snapshot.user_id != self.user_id`. 59/60 of those clones are pure waste.
+- The cloned payload is huge: rooms `Vec<(ChatRoom, Vec<ChatMessage>)>` (general up to 1000 msgs + selected room up to 1000), `usernames` HashMap, `bonsai_glyphs` HashMap, `all_usernames` Vec.
+- The clone runs under the per-session render mutex, so it directly extends item A's lock-hold time.
+- **Cheap interim:** peek `borrow().user_id` first, only clone if it matches the receiver.
+- **Real fix:** the `ChatGlobalsService` split already proposed in §7 — global maps in their own `watch<Arc<…>>`, per-user state in per-user channels (mirror `ProfileService`'s per-user-keyed senders).
+
+### D. Per-user 10s refresh does heavy work for everyone, every cycle
+- `list_chat_rooms` (`late-ssh/src/app/chat/svc.rs:179`) runs every 10s per session and unconditionally fetches:
+  - room membership + unread counts (`svc.rs:181`, `svc.rs:182`)
+  - up to 1000 messages for the active room (`svc.rs:191`)
+  - up to 1000 messages for `#general` (`svc.rs:196`) — **even when the user isn't on the dashboard**
+  - all usernames (`svc.rs:209`) — global, identical for everyone
+  - all bonsai trees (`svc.rs:213`) — global, identical for everyone
+  - per-user ignored list
+- At 60 users that's ~120 list_recent calls / 10s shipping ~12k+ rows/sec from PG just for the warm-tail refresh.
+- **Direction:** drop `HISTORY_LIMIT` to ~200 (no human reads back 1000), let general's tail be cached once in `ChatService` (broadcasts already keep it warm), only fetch the *selected* non-general room per-user.
+- Refresh task itself stays — it's load-bearing for dropped-broadcast recovery (lagged `MessageCreated`/`MessageEdited`); only the global queries and the volume move out.
+
+### E. Unread-count query may get painful as message volume grows
+- `ChatRoomMember::unread_counts_for_user` (`late-core/src/models/chat_room_member.rs:99`) LEFT-JOINs `chat_messages` and counts every row newer than `last_read_at` for every membership row. Index `idx_chat_messages_room_created` on `(room_id, created DESC, id DESC)` exists, so plans should use it, but the query still scans all unread rows per room.
+- Not the primary suspect at 60 users today, but worth `EXPLAIN ANALYZE` once message volume grows. Could also be replaced by a maintained counter if it shows up in profiles.
+
+### F. Snapshot merge clones inactive rooms' history vectors
+- `merge_rooms` (`late-ssh/src/app/chat/state.rs:1394`) preserves cached messages on snapshots that arrive with empty per-room vecs by **cloning the previous Vec<ChatMessage>** for each such room. Prevents the flash-clear race, but means every refresh copies large per-room message vecs around instead of doing a lightweight metadata update.
+- **Direction:** carry per-room metadata (id, name, kind, member info, unread count) separately from the message tail, and only swap the message tail when the snapshot actually carries one for that room.
+
+### Suggested order
+1. **A** (input/render lock split) and **B** (cache fingerprint cap/incremental) — pure local changes, immediate user-felt latency win.
+2. **C-cheap** (peek user_id before clone) — one-line patch, biggest CPU cut of the bunch.
+3. **D** (drop HISTORY_LIMIT, stop refetching general per-user) — small change, kills the bulk of PG churn.
+4. **C-real** + **F** (`ChatGlobalsService` split, per-room metadata vs. tail separation) — bigger refactor, removes the N² shape entirely.
+5. **E** if it shows up in PG profiles after the above.
+
+### Out of scope of this investigation
+- Paired-client viz WS path is local per-token (`mpsc::channel(64)`) and not the suspect. The visualizer-driven full ratatui redrawing is part of A's per-tick cost, not a separate bottleneck.
 
 ---
 
@@ -901,7 +1017,7 @@ Use narrower crate-specific `cargo test` / `cargo nextest run` commands ad hoc w
 | **Dashboard** | 1 | Active | Now playing + vibe voting + `/music` hint + dashboard chat (The Lounge Hub) |
 | **Chat** | 2 | Active | Full room-list chat screen (`/dm @user`, `/join #room`, `/create #room`, `/leave`, `/active`, `/list`, `/ignore [@user]`, `/unignore [@user]`, `/music`, `/help`) with grouped room sections and a synthetic `news` entry in the room list |
 | **Games** | 3 | Active | The Arcade Lobby + leaderboard sidebar (champions, streaks, all-time high scores, chip leaders, info): persisted high-score games (`2048`, `Tetris`), daily games (`Sudoku`, `Nonograms`, `Minesweeper`, `Solitaire`), and admin-gated shared-table Blackjack. Game list auto-scrolls (top-third anchor); ASCII header hides on small screens |
-| **Profile** | 4 | Active | User profile: username, Notifications (OSC 777/9 desktop notifications — opt-in checkboxes for DMs / `@mentions` / game events, plus a shared cooldown; no tmux support), Your Stats (streak + badge, chips, high scores), @bot/@graybeard info, chat colors |
+| **Profile** | 4 | Active | Read-only public identity card: username, country, timezone, optional `Current time` (derived from timezone when parseable), bio, Your Stats (streak + badge, chips, high scores), @bot/@graybeard info. Bio is wrapped at the same width the modal editor uses (`welcome_modal::ui::bio_text_width(MODAL_WIDTH)`) via `build_composer_rows`, so pasted URLs fold instead of running off-screen. All editing happens in the **welcome/profile modal** (auto-opens on first login, reopen via Profile's edit action) — sectioned into Identity / Appearance / Notifications / Location, with a Save CTA and a `?` callout that opens the help modal on top. Bio is an inline full-width bordered editor under the Identity heading (encouraging people to share site / GitHub / socials); it accepts bracketed-paste so URLs drop in whole. Theme + background color preview live from the draft while the modal is open. Selecting a chat message and pressing `p` opens a separate read-only **profile modal** for that author; it shows the same public identity summary, supports `j/k` or arrows for scroll, and is slightly wider than the first revision. |
 
 ### Layout
 
@@ -939,7 +1055,10 @@ Toast notification is hidden by default (0 rows). When active, it appears as a 3
 | Key | Context | Action |
 |-----|---------|--------|
 | `q` / `Q` / `Ctrl+C` | Global | Quit |
-| `?` | Global (not composing) | Open keybindings help modal (scrollable with j/k/arrows/mouse) |
+| `?` | Global (not composing) | Open help modal (multi-slide guide). Also works inside the welcome/profile modal, which renders help on top while keeping the draft intact. |
+| `h` / `l` / `←` / `→` | Help modal | Switch slides (Overview / Chat / Music / News / Arcade / Bonsai / Profile / Architecture) |
+| `j` / `k` / `↑` / `↓` | Help modal | Scroll current slide (uncapped — past the last line is blank space) |
+| `?` / `q` / `Esc` | Help modal | Close (returns to underlying screen, including welcome modal if it was open) |
 | `Tab` | Global | Cycle screens |
 | `1` | Global | Jump to Dashboard |
 | `2` | Global | Jump to Chat |
@@ -953,6 +1072,7 @@ Toast notification is hidden by default (0 rows). When active, it appears as a 3
 | `L` / `C` / `A` / `Z` | Dashboard | Vote genre |
 | `s` | Dashboard | Copy bonsai ASCII snippet to clipboard |
 | `j` / `k` / arrows | Dashboard | Scroll chat |
+| `p` | Dashboard chat selection | Open selected user's read-only profile modal |
 | `r` | Dashboard chat selection | Reply to selected general chat message |
 | `e` | Dashboard / Chat (own message selected) | Edit selected message — same composer, different title |
 | `d` | Dashboard / Chat (own message selected) | Delete selected message |
@@ -991,7 +1111,9 @@ Toast notification is hidden by default (0 rows). When active, it appears as a 3
 | `Esc` | Chat (`news` composing) | Cancel URL compose |
 | `i` / `Enter` | Dashboard | Start composing chat |
 | `j` / `k` | Chat | Move message selection newer/older |
+| `p` | Chat | Open selected user's read-only profile modal |
 | `r` | Chat | Reply to selected message |
+| `P` | Global | Show browser-pairing QR (copies pairing URL) |
 | `/help` | Chat composer | Open scrollable chat help overlay (commands + all chat keys) |
 | `/active` | Chat composer | List active SSH users from the in-memory session registry |
 | `/list` | Chat composer | List users in the selected non-auto-join ("private") room |
@@ -1000,10 +1122,14 @@ Toast notification is hidden by default (0 rows). When active, it appears as a 3
 | `/unignore [@user]` | Chat composer | Remove a user from your ignore list |
 | `j` / `k` / arrows | Chat overlay (`/help`, ignore list) | Scroll overlay |
 | `q` / `Esc` | Chat overlay (`/help`, ignore list) | Close overlay |
-| `↑` / `↓` | Profile | Move between settings rows |
-| `←` / `→` | Profile | Adjust the current row (cycles the cooldown value; also toggles a checkbox) |
-| `Space` / `Enter` | Profile | Toggle the currently selected notification checkbox (or bump the cooldown forward) |
-| `i` | Profile | Edit username (Enter saves, Esc cancels; whitespace is trimmed on save) |
+| `Enter` | Profile screen | Open the welcome/profile modal to edit |
+| `↑` / `↓` / `j` / `k` | Welcome/profile modal | Move between rows (Username, Bio, Theme, Background, DMs, @mentions, Game events, Bell, Cooldown, Country, Timezone, Save) |
+| `←` / `→` | Welcome/profile modal | Cycle the current row's setting (theme, toggles, cooldown) |
+| `Space` / `Enter` / `e` | Welcome/profile modal | Activate row — edit username/bio, cycle a setting, open country/timezone picker, or fire Save |
+| `Alt+Enter` | Welcome/profile modal (bio editing) | Insert newline |
+| `?` | Welcome/profile modal | Open help modal on top |
+| `j` / `k` / `↑` / `↓` | Read-only profile modal | Scroll |
+| `q` / `Esc` | Read-only profile modal | Close |
 | `Esc` | Any modal | Close/cancel |
 | `c` | Chat (not composing) | Open web chat QR (copies URL + shows it as fallback) |
 | `Ctrl+]` | Dashboard / Chat | Open icon picker (emoji + nerd font). Auto-starts the composer if not already composing. Inserts into the chat composer only. |
@@ -1020,10 +1146,10 @@ Toast notification is hidden by default (0 rows). When active, it appears as a 3
 When modifying any keybinding, update **all** of the following:
 
 1. **Input handler** — the actual `match byte` in the relevant `input.rs` (screen-specific or `app/input.rs` for globals)
-2. **Help modal** — `app/render.rs` `draw_help_overlay()`, two-column keybinding list
-3. **Welcome modal** — `app/render.rs` `draw_welcome_overlay()`, if the key is mentioned in the getting-started section
+2. **Help modal** — `app/help_modal/data.rs` (slide copy, e.g. Overview "This modal" section) and `app/help_modal/ui.rs` `draw_footer()` keybind line
+3. **Welcome modal** — `app/welcome_modal/ui.rs` `draw_footer()` keybind line and the bordered help callout in `draw_help_callout()`
 4. **Sidebar hints** — `app/common/sidebar.rs`, e.g. the volume/mute hint line in Now Playing
-5. **Game guard** — `app/input.rs` `handle_global_key()` line ~540, the `!matches!(byte, ...)` allowlist for keys that pass through during active games
+5. **Game guard** — `app/input.rs` `handle_global_key()`, the `!matches!(byte, ...)` allowlist for keys that pass through during active games
 6. **This table** — the keyboard shortcuts table above in CONTEXT.md
 7. **Game info panels** — per-game UI panels that show controls (check each game's `ui.rs`)
 

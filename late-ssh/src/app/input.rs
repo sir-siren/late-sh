@@ -1,4 +1,6 @@
-use super::{chat, dashboard, icon_picker, profile, state::App};
+use super::{
+    chat, dashboard, help_modal, icon_picker, profile, profile_modal, state::App, welcome_modal,
+};
 use crate::app::common::primitives::Screen;
 use std::{mem, time::Duration};
 use vte::{Params, Parser, Perform};
@@ -46,17 +48,22 @@ enum PasteTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ParsedInput {
+pub(crate) enum ParsedInput {
+    Char(char),
     Byte(u8),
     Arrow(u8),
     CtrlArrow(u8),
+    Delete,
     CtrlBackspace,
     CtrlDelete,
     Scroll(isize),
-    MousePress { x: u16, y: u16 },
+    MousePress {
+        x: u16,
+        y: u16,
+    },
     BackTab,
-    // Alt+Enter inserts a newline. `ESC + CR/LF` is pre-scanned because vte
-    // routes C0 bytes through `execute`, not `esc_dispatch`.
+    // Alt+Enter inserts a newline. `ESC`-prefixed control chords that would
+    // otherwise wedge vte are pre-scanned before the parser sees them.
     AltEnter,
     // Alt+S submits without closing the composer. Picked over Ctrl+Enter
     // because tmux collapses Ctrl-modified Enter to bare `\r` unless the
@@ -68,30 +75,41 @@ enum ParsedInput {
     End,
     FocusGained,
     FocusLost,
+    /// Payload of an XTVERSION (`CSI > q`) DCS reply — the bytes between
+    /// `ESC P > |` and `ESC \`, e.g. `kitty(0.31.0)`.
+    TerminalVersion(String),
 }
 
-/// Walk `data` and split it on inline `ESC` + `CR`/`LF` pairs (Alt+Enter).
-///
-/// vte routes C0 control bytes through `execute` while the parser is in
-/// escape state, which means `esc_dispatch` never sees `\r` or `\n` as the
-/// final byte of an `ESC <byte>` sequence. Without this pre-scan, Alt+Enter
-/// would be emitted as a plain Enter keypress and submit the composer.
+/// vte keeps pending escape state when `ESC` is followed by control bytes
+/// such as `CR`, `LF`, or `BS`, so pre-scan those chords before feeding the
+/// parser. This keeps Alt+Enter and Alt+Backspace from wedging subsequent
+/// input when the chord is split across reads.
 #[derive(Debug, Eq, PartialEq)]
-enum AltEnterChunk<'a> {
+enum EscapedInputChunk<'a> {
     Bytes(&'a [u8]),
-    AltEnter,
+    Event(ParsedInput),
 }
 
-fn split_alt_enter(data: &[u8]) -> Vec<AltEnterChunk<'_>> {
+fn escaped_input_event(byte: u8) -> Option<ParsedInput> {
+    match byte {
+        b'\r' | b'\n' => Some(ParsedInput::AltEnter),
+        0x08 | 0x7F => Some(ParsedInput::CtrlBackspace),
+        _ => None,
+    }
+}
+
+fn split_escaped_input(data: &[u8]) -> Vec<EscapedInputChunk<'_>> {
     let mut out = Vec::new();
     let mut seg_start = 0;
     let mut i = 0;
     while i + 1 < data.len() {
-        if data[i] == 0x1B && matches!(data[i + 1], b'\r' | b'\n') {
+        if data[i] == 0x1B
+            && let Some(event) = escaped_input_event(data[i + 1])
+        {
             if i > seg_start {
-                out.push(AltEnterChunk::Bytes(&data[seg_start..i]));
+                out.push(EscapedInputChunk::Bytes(&data[seg_start..i]));
             }
-            out.push(AltEnterChunk::AltEnter);
+            out.push(EscapedInputChunk::Event(event));
             i += 2;
             seg_start = i;
         } else {
@@ -99,7 +117,7 @@ fn split_alt_enter(data: &[u8]) -> Vec<AltEnterChunk<'_>> {
         }
     }
     if seg_start < data.len() {
-        out.push(AltEnterChunk::Bytes(&data[seg_start..]));
+        out.push(EscapedInputChunk::Bytes(&data[seg_start..]));
     }
     out
 }
@@ -135,6 +153,9 @@ struct VtCollector {
     events: Vec<ParsedInput>,
     paste: Option<Vec<u8>>,
     ss3_pending: bool,
+    /// Buffer for an in-flight XTVERSION DCS reply. `Some` between
+    /// `hook()` (when we see the `|` final byte) and `unhook()`.
+    xtversion_buf: Option<Vec<u8>>,
 }
 
 impl VtCollector {
@@ -147,14 +168,15 @@ impl VtCollector {
     }
 
     fn push_char(&mut self, ch: char) {
-        let mut buf = [0; 4];
-        let bytes = ch.encode_utf8(&mut buf).as_bytes();
         if let Some(paste) = &mut self.paste {
-            paste.extend_from_slice(bytes);
+            let mut buf = [0; 4];
+            paste.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        } else if ch.is_ascii_control() {
+            // vte routes DEL (0x7F) through `print`, not `execute`. Keep it
+            // on the control-byte path so Backspace in composers still works.
+            self.events.push(ParsedInput::Byte(ch as u8));
         } else {
-            for &byte in bytes {
-                self.events.push(ParsedInput::Byte(byte));
-            }
+            self.events.push(ParsedInput::Char(ch));
         }
     }
 
@@ -189,11 +211,32 @@ impl Perform for VtCollector {
         self.push_byte(byte);
     }
 
-    fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
+    fn hook(&mut self, _: &Params, _: &[u8], _: bool, action: char) {
+        // XTVERSION reply: `ESC P > | <name>(<version>) ESC \`. The final
+        // byte is `|` (0x7C). We key off that rather than the `>` private
+        // marker because different vte versions surface the marker via
+        // params vs intermediates. Buffer up to 256 bytes of payload to
+        // guard against a runaway DCS.
+        if action == '|' {
+            self.xtversion_buf = Some(Vec::new());
+        }
+    }
 
-    fn put(&mut self, _: u8) {}
+    fn put(&mut self, byte: u8) {
+        if let Some(buf) = &mut self.xtversion_buf
+            && buf.len() < 256
+        {
+            buf.push(byte);
+        }
+    }
 
-    fn unhook(&mut self) {}
+    fn unhook(&mut self) {
+        if let Some(buf) = self.xtversion_buf.take()
+            && let Ok(payload) = String::from_utf8(buf)
+        {
+            self.events.push(ParsedInput::TerminalVersion(payload));
+        }
+    }
 
     fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
 
@@ -226,6 +269,9 @@ impl Perform for VtCollector {
             }
             '~' if p0 == Some(3) && p1 == Some(5) => {
                 self.events.push(ParsedInput::CtrlDelete);
+            }
+            '~' if p0 == Some(3) => {
+                self.events.push(ParsedInput::Delete);
             }
             '~' if p0 == Some(8) && p1 == Some(5) => {
                 self.events.push(ParsedInput::CtrlBackspace);
@@ -319,53 +365,82 @@ pub fn flush_pending_escape(app: &mut App) {
     dispatch_escape(app);
 }
 
+/// Splice complete XTVERSION DCS replies out of `data`, returning the
+/// remaining bytes and the extracted payloads. Only matches the specific
+/// `ESC P > | ... ST` shape so other DCS traffic passes through untouched.
+/// An incomplete reply (no terminator found) is left in place for the main
+/// vt parser to buffer across subsequent reads.
+fn extract_xtversion_replies(data: &[u8]) -> (std::borrow::Cow<'_, [u8]>, Vec<String>) {
+    let mut out: Vec<u8> = Vec::new();
+    let mut payloads: Vec<String> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    let mut any_stripped = false;
+
+    while i < data.len() {
+        let is_xtver_start = data[i] == 0x1B
+            && i + 3 < data.len()
+            && data[i + 1] == b'P'
+            && data[i + 2] == b'>'
+            && data[i + 3] == b'|';
+        if !is_xtver_start {
+            i += 1;
+            continue;
+        }
+
+        // Locate the String Terminator: BEL (0x07) or ESC `\`.
+        let payload_start = i + 4;
+        let mut j = payload_start;
+        let mut term_len = 0usize;
+        while j < data.len() {
+            if data[j] == 0x07 {
+                term_len = 1;
+                break;
+            }
+            if data[j] == 0x1B && j + 1 < data.len() && data[j + 1] == b'\\' {
+                term_len = 2;
+                break;
+            }
+            j += 1;
+        }
+        if term_len == 0 {
+            // Incomplete; leave the remainder untouched.
+            break;
+        }
+
+        out.extend_from_slice(&data[seg_start..i]);
+        if let Ok(s) = std::str::from_utf8(&data[payload_start..j]) {
+            payloads.push(s.to_string());
+        }
+        i = j + term_len;
+        seg_start = i;
+        any_stripped = true;
+    }
+
+    if !any_stripped {
+        return (std::borrow::Cow::Borrowed(data), payloads);
+    }
+    out.extend_from_slice(&data[seg_start..]);
+    (std::borrow::Cow::Owned(out), payloads)
+}
+
 pub fn handle(app: &mut App, data: &[u8]) {
+    // Pull any complete XTVERSION DCS replies out of the raw byte stream
+    // before the splash/welcome short-circuits below, which otherwise see
+    // the leading ESC byte and drop the reply on the floor (and dismiss
+    // the splash prematurely). The reply also passes through vt_input in
+    // the normal path after splash; `set_terminal_version` is idempotent.
+    let (stripped, xtversion_payloads) = extract_xtversion_replies(data);
+    for payload in xtversion_payloads {
+        app.set_terminal_version(&payload);
+    }
+    let data: &[u8] = &stripped;
+
     if app.show_splash {
         // Do not process input while splash screen is showing
         // Escape skips the rest of the intro animation
         if data.contains(&0x1B) {
             app.show_splash = false;
-        }
-        return;
-    }
-
-    if app.show_welcome && !data.is_empty() {
-        app.show_welcome = false;
-        return;
-    }
-
-    // Help overlay: scroll with j/k/arrows/mouse wheel, dismiss with ?/Esc/q
-    if app.show_help && !data.is_empty() {
-        let mut i = 0;
-        while i < data.len() {
-            // ESC sequences
-            if data[i] == 0x1B && i + 1 < data.len() && data[i + 1] == b'[' {
-                // Arrow keys: ESC [ A/B
-                if i + 2 < data.len() {
-                    match data[i + 2] {
-                        b'B' => app.help_scroll = app.help_scroll.saturating_add(1),
-                        b'A' => app.help_scroll = app.help_scroll.saturating_sub(1),
-                        _ => {}
-                    }
-                    i += 3;
-                    continue;
-                }
-            }
-            // Lone ESC = close
-            if data[i] == 0x1B {
-                app.show_help = false;
-                return;
-            }
-            match data[i] {
-                b'?' | b'q' => {
-                    app.show_help = false;
-                    return;
-                }
-                b'j' => app.help_scroll = app.help_scroll.saturating_add(1),
-                b'k' => app.help_scroll = app.help_scroll.saturating_sub(1),
-                _ => {}
-            }
-            i += 1;
         }
         return;
     }
@@ -377,16 +452,17 @@ pub fn handle(app: &mut App, data: &[u8]) {
         return;
     }
 
-    // Split-across-reads Alt+Enter: previous read ended with a lone ESC and
-    // this one begins with CR/LF. vte would execute the CR/LF as a plain
-    // Enter while still sitting in escape state, submitting the composer
-    // instead of inserting a newline. Intercept here before anything else.
+    // Split-across-reads `ESC` chords: previous read ended with a lone ESC
+    // and this one begins with a control byte that should be treated as an
+    // Alt chord instead of feeding a wedged parser.
     let mut start = 0;
-    if app.pending_escape && matches!(data.first(), Some(b'\r') | Some(b'\n')) {
+    if app.pending_escape
+        && let Some(event) = data.first().and_then(|byte| escaped_input_event(*byte))
+    {
         app.pending_escape = false;
         app.pending_escape_started_at = None;
         app.vt_input.reset();
-        handle_parsed_input(app, ParsedInput::AltEnter);
+        handle_parsed_input(app, event);
         start = 1;
     }
 
@@ -400,14 +476,13 @@ pub fn handle(app: &mut App, data: &[u8]) {
         dispatch_escape(app);
     }
 
-    // Inline Alt+Enter: pre-scan and split on ESC+CR/LF pairs. Each segment
-    // is fed to vte independently and an AltEnter event is emitted at each
-    // split point. See `split_alt_enter` for why this can't live in the
-    // `Perform` impl.
-    for chunk in split_alt_enter(&data[start..]) {
+    // Inline `ESC` control chords: pre-scan and split on the sequences that
+    // would otherwise leave vte mid-escape. Each segment is fed to vte
+    // independently and recognized chords are emitted directly.
+    for chunk in split_escaped_input(&data[start..]) {
         match chunk {
-            AltEnterChunk::Bytes(bytes) => handle_vt_segment(app, bytes),
-            AltEnterChunk::AltEnter => handle_parsed_input(app, ParsedInput::AltEnter),
+            EscapedInputChunk::Bytes(bytes) => handle_vt_segment(app, bytes),
+            EscapedInputChunk::Event(event) => handle_parsed_input(app, event),
         }
     }
 
@@ -443,6 +518,22 @@ fn handle_overlay_input(app: &mut App, event: &ParsedInput) {
 }
 
 fn handle_parsed_input(app: &mut App, event: ParsedInput) {
+    // Help is the topmost modal: when both are open it owns input.
+    if app.show_help {
+        help_modal::input::handle_input(app, event);
+        return;
+    }
+
+    if app.show_welcome {
+        welcome_modal::input::handle_input(app, event);
+        return;
+    }
+
+    if app.show_profile_modal {
+        profile_modal::input::handle_input(app, event);
+        return;
+    }
+
     // Picker intercepts all input when open (ESC is handled via dispatch_escape).
     if app.icon_picker_open {
         handle_icon_picker_input(app, event);
@@ -458,6 +549,7 @@ fn handle_parsed_input(app: &mut App, event: ParsedInput) {
 
     match event {
         ParsedInput::FocusGained | ParsedInput::FocusLost => {}
+        ParsedInput::TerminalVersion(payload) => app.set_terminal_version(&payload),
         ParsedInput::Paste(pasted) => handle_bracketed_paste(app, &pasted),
         ParsedInput::AltEnter => {
             if (ctx.screen == Screen::Dashboard || ctx.screen == Screen::Chat) && ctx.chat_composing
@@ -467,17 +559,46 @@ fn handle_parsed_input(app: &mut App, event: ParsedInput) {
             }
         }
         ParsedInput::AltS => {
-            if (ctx.screen == Screen::Dashboard || ctx.screen == Screen::Chat)
-                && ctx.chat_composing
-                && let Some(b) = app.chat.submit_composer(true)
+            if (ctx.screen == Screen::Dashboard || ctx.screen == Screen::Chat) && ctx.chat_composing
             {
-                app.banner = Some(b);
+                if let Some(b) = app.chat.submit_composer(true) {
+                    app.banner = Some(b);
+                }
+                if let Some(topic) = app.chat.take_requested_help_topic() {
+                    app.help_modal_state.open(topic);
+                    app.show_help = true;
+                }
             }
         }
         ParsedInput::Scroll(delta) => handle_scroll_for_screen(app, ctx.screen, delta),
         // Mouse clicks only matter inside the icon picker today; ignore here.
         ParsedInput::MousePress { .. } => {}
-        ParsedInput::BackTab => {}
+        ParsedInput::BackTab => {
+            if ctx.screen == Screen::Chat && app.chat.room_jump_active {
+                return;
+            }
+            if (ctx.screen == Screen::Dashboard || ctx.screen == Screen::Chat) && ctx.chat_composing
+            {
+                return;
+            }
+            if ctx.screen == Screen::Chat && ctx.news_composing {
+                return;
+            }
+            if ctx.screen == Screen::Profile && ctx.profile_composing {
+                return;
+            }
+            if ctx.screen == Screen::Games && app.is_playing_game {
+                return;
+            }
+            reset_composers_for_page_change(app);
+            app.screen = ctx.screen.prev();
+            if app.screen == Screen::Chat {
+                app.chat.request_list();
+                app.chat.sync_selection();
+                app.chat.mark_selected_room_read();
+            }
+            app.chat.clear_message_selection();
+        }
         // Page keys mirror Ctrl-U / Ctrl-D. Signs follow the existing scheme:
         // positive = toward older/top, negative = toward newer/bottom. See
         // `app.chat.select_message` — its `delta` is in MESSAGES, not rows,
@@ -503,7 +624,21 @@ fn handle_parsed_input(app: &mut App, event: ParsedInput) {
             }
             handle_scroll_for_screen(app, ctx.screen, isize::MIN)
         }
+        ParsedInput::Delete
+            if (ctx.screen == Screen::Chat || ctx.screen == Screen::Dashboard)
+                && ctx.chat_composing =>
+        {
+            app.chat.composer_delete_right();
+            app.chat.update_autocomplete();
+        }
         ParsedInput::CtrlBackspace
+            if (ctx.screen == Screen::Chat || ctx.screen == Screen::Dashboard)
+                && ctx.chat_composing =>
+        {
+            app.chat.composer_delete_word_left();
+            app.chat.update_autocomplete();
+        }
+        ParsedInput::Byte(0x17)
             if (ctx.screen == Screen::Chat || ctx.screen == Screen::Dashboard)
                 && ctx.chat_composing =>
         {
@@ -538,7 +673,10 @@ fn handle_parsed_input(app: &mut App, event: ParsedInput) {
                 app.chat.composer_cursor_word_left();
             }
         }
-        ParsedInput::CtrlArrow(_) | ParsedInput::CtrlBackspace | ParsedInput::CtrlDelete => {}
+        ParsedInput::Delete
+        | ParsedInput::CtrlArrow(_)
+        | ParsedInput::CtrlBackspace
+        | ParsedInput::CtrlDelete => {}
         ParsedInput::Arrow(key) => {
             if ctx.screen == Screen::Chat && app.chat.room_jump_active {
                 let _ = chat::input::handle_arrow(app, key);
@@ -578,27 +716,58 @@ fn handle_parsed_input(app: &mut App, event: ParsedInput) {
             app.chat.update_autocomplete();
         }
         ParsedInput::Byte(0x1D) => try_open_icon_picker(app),
-        ParsedInput::Byte(byte) => {
-            if ctx.screen == Screen::Chat && app.chat.room_jump_active {
-                let _ = chat::input::handle_byte(app, byte);
+        ParsedInput::Byte(byte) => handle_byte_event(app, ctx, byte),
+        ParsedInput::Char(ch) => {
+            if route_char_to_composer(app, ctx, ch) {
                 return;
             }
-
-            if handle_modal_input(app, ctx, byte) {
-                return;
+            // Hotkey dispatchers are byte-oriented; non-ASCII can't match.
+            if ch.is_ascii() {
+                handle_byte_event(app, ctx, ch as u8);
             }
-
-            if handle_global_key(app, ctx, byte) {
-                app.chat.clear_message_selection();
-                return;
-            }
-
-            dispatch_screen_key(app, ctx.screen, byte);
         }
     }
 }
 
+fn route_char_to_composer(app: &mut App, ctx: InputContext, ch: char) -> bool {
+    if (ctx.screen == Screen::Chat || ctx.screen == Screen::Dashboard) && ctx.chat_composing {
+        chat::input::handle_compose_char(app, ch);
+        return true;
+    }
+    false
+}
+
+fn handle_byte_event(app: &mut App, ctx: InputContext, byte: u8) {
+    if ctx.screen == Screen::Chat && app.chat.room_jump_active {
+        let _ = chat::input::handle_byte(app, byte);
+        return;
+    }
+
+    if handle_modal_input(app, ctx, byte) {
+        return;
+    }
+
+    if handle_global_key(app, ctx, byte) {
+        app.chat.clear_message_selection();
+        return;
+    }
+
+    dispatch_screen_key(app, ctx.screen, byte);
+}
+
 fn dispatch_escape(app: &mut App) {
+    if app.show_help {
+        help_modal::input::handle_escape(app);
+        return;
+    }
+    if app.show_welcome {
+        welcome_modal::input::handle_escape(app);
+        return;
+    }
+    if app.show_profile_modal {
+        profile_modal::input::handle_escape(app);
+        return;
+    }
     if app.icon_picker_open {
         app.icon_picker_open = false;
         return;
@@ -753,8 +922,9 @@ fn reset_composers_for_page_change(app: &mut App) {
 fn handle_global_key(app: &mut App, ctx: InputContext, byte: u8) -> bool {
     // ? opens help unless composing text
     if byte == b'?' && !ctx.chat_composing && !ctx.news_composing && !ctx.profile_composing {
+        app.help_modal_state
+            .open(crate::app::help_modal::data::HelpTopic::Overview);
         app.show_help = true;
-        app.help_scroll = 0;
         return true;
     }
 
@@ -906,7 +1076,7 @@ fn handle_global_key(app: &mut App, ctx: InputContext, byte: u8) -> bool {
             }
             true
         }
-        b'p' | b'P' => {
+        b'P' => {
             app.pending_clipboard = Some(app.connect_url.clone());
             app.web_chat_qr_url = Some(app.connect_url.clone());
             app.show_web_chat_qr = true;
@@ -963,20 +1133,18 @@ fn handle_icon_picker_input(app: &mut App, event: ParsedInput) {
     match event {
         ParsedInput::Byte(b'\r') => apply_icon_selection(app, false),
         ParsedInput::AltEnter => apply_icon_selection(app, true),
-        ParsedInput::Byte(0x7f) => {
-            if app.icon_picker_state.search_cursor > 0 {
-                let byte_pos = app
-                    .icon_picker_state
-                    .search_query
-                    .char_indices()
-                    .nth(app.icon_picker_state.search_cursor - 1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                app.icon_picker_state.search_query.remove(byte_pos);
-                app.icon_picker_state.search_cursor -= 1;
-                app.icon_picker_state.selected_index = 0;
-                app.icon_picker_state.scroll_offset = 0;
-            }
+        ParsedInput::Byte(0x7f) if app.icon_picker_state.search_cursor > 0 => {
+            let byte_pos = app
+                .icon_picker_state
+                .search_query
+                .char_indices()
+                .nth(app.icon_picker_state.search_cursor - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            app.icon_picker_state.search_query.remove(byte_pos);
+            app.icon_picker_state.search_cursor -= 1;
+            app.icon_picker_state.selected_index = 0;
+            app.icon_picker_state.scroll_offset = 0;
         }
         ParsedInput::Arrow(b'A') => picker_move_selection(app, -1),
         ParsedInput::Arrow(b'B') => picker_move_selection(app, 1),
@@ -1012,19 +1180,18 @@ fn handle_icon_picker_input(app: &mut App, event: ParsedInput) {
             picker_move_selection(app, half);
         }
         ParsedInput::MousePress { x, y } => handle_icon_picker_click(app, x, y),
-        ParsedInput::Byte(byte) if (b' '..=b'~').contains(&byte) => {
-            let c = byte as char;
-            let byte_pos = app
-                .icon_picker_state
+        ParsedInput::Char(ch) if !ch.is_control() => {
+            let state = &mut app.icon_picker_state;
+            let byte_pos = state
                 .search_query
                 .char_indices()
-                .nth(app.icon_picker_state.search_cursor)
+                .nth(state.search_cursor)
                 .map(|(i, _)| i)
-                .unwrap_or(app.icon_picker_state.search_query.len());
-            app.icon_picker_state.search_query.insert(byte_pos, c);
-            app.icon_picker_state.search_cursor += 1;
-            app.icon_picker_state.selected_index = 0;
-            app.icon_picker_state.scroll_offset = 0;
+                .unwrap_or(state.search_query.len());
+            state.search_query.insert(byte_pos, ch);
+            state.search_cursor += 1;
+            state.selected_index = 0;
+            state.scroll_offset = 0;
         }
         _ => {}
     }
@@ -1198,12 +1365,82 @@ mod tests {
     }
 
     #[test]
+    fn vt_parser_reads_backtab_sequence() {
+        let mut parser = VtInputParser::default();
+        assert_eq!(parser.feed(b"\x1b[Z"), vec![ParsedInput::BackTab]);
+    }
+
+    #[test]
     fn vt_parser_parses_scroll_events() {
         let mut parser = VtInputParser::default();
         assert_eq!(parser.feed(b"\x1b[<64;10;5M"), vec![ParsedInput::Scroll(1)]);
         assert_eq!(
             parser.feed(b"\x1b[<65;10;5m"),
             vec![ParsedInput::Scroll(-1)]
+        );
+    }
+
+    #[test]
+    fn extract_xtversion_strips_and_returns_payload() {
+        // Single, standalone reply.
+        let (rest, payloads) = extract_xtversion_replies(b"\x1bP>|kitty(0.31.0)\x1b\\");
+        assert_eq!(rest.as_ref(), b"");
+        assert_eq!(payloads, vec!["kitty(0.31.0)".to_string()]);
+    }
+
+    #[test]
+    fn extract_xtversion_strips_mixed_with_other_bytes() {
+        // Reply surrounded by other keystrokes — rest should keep those.
+        let (rest, payloads) = extract_xtversion_replies(b"abc\x1bP>|foo(1)\x1b\\def");
+        assert_eq!(rest.as_ref(), b"abcdef");
+        assert_eq!(payloads, vec!["foo(1)".to_string()]);
+    }
+
+    #[test]
+    fn extract_xtversion_incomplete_left_in_place() {
+        // No terminator → leave it; main vt parser will buffer across reads.
+        let (rest, payloads) = extract_xtversion_replies(b"\x1bP>|kitty");
+        assert_eq!(rest.as_ref(), b"\x1bP>|kitty");
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn extract_xtversion_ignores_non_xtversion_dcs() {
+        // Different DCS final byte (`q`, e.g. Sixel) — leave it alone.
+        let (rest, payloads) = extract_xtversion_replies(b"\x1bPq...\x1b\\");
+        assert_eq!(rest.as_ref(), b"\x1bPq...\x1b\\");
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn extract_xtversion_handles_bel_terminator() {
+        let (rest, payloads) = extract_xtversion_replies(b"\x1bP>|foo(1)\x07tail");
+        assert_eq!(rest.as_ref(), b"tail");
+        assert_eq!(payloads, vec!["foo(1)".to_string()]);
+    }
+
+    #[test]
+    fn vt_parser_reads_xtversion_dcs_reply() {
+        let mut parser = VtInputParser::default();
+        // `ESC P > | kitty(0.31.0) ESC \` — the reply shape we care about.
+        let events = parser.feed(b"\x1bP>|kitty(0.31.0)\x1b\\");
+        assert_eq!(
+            events,
+            vec![ParsedInput::TerminalVersion("kitty(0.31.0)".into())]
+        );
+    }
+
+    #[test]
+    fn vt_parser_reads_xtversion_dcs_reply_split_across_writes() {
+        // The DCS reply can arrive in multiple read() chunks over the wire;
+        // vte's state machine must hold state across feed calls.
+        let mut parser = VtInputParser::default();
+        let mut events = parser.feed(b"\x1bP>|WezTer");
+        events.extend(parser.feed(b"m(20240127)"));
+        events.extend(parser.feed(b"\x1b\\"));
+        assert_eq!(
+            events,
+            vec![ParsedInput::TerminalVersion("WezTerm(20240127)".into())]
         );
     }
 
@@ -1215,6 +1452,7 @@ mod tests {
             vec![ParsedInput::CtrlArrow(b'C')]
         );
         assert_eq!(parser.feed(b"\x1b[5D"), vec![ParsedInput::CtrlArrow(b'D')]);
+        assert_eq!(parser.feed(b"\x1b[3~"), vec![ParsedInput::Delete]);
         assert_eq!(parser.feed(b"\x1b[3;5~"), vec![ParsedInput::CtrlDelete]);
         assert_eq!(
             parser.feed(b"\x1b[127;5u"),
@@ -1242,7 +1480,7 @@ mod tests {
         let mut parser = VtInputParser::default();
         assert!(parser.feed(b"\x1b").is_empty());
         parser.reset();
-        assert_eq!(parser.feed(b"j"), vec![ParsedInput::Byte(b'j')]);
+        assert_eq!(parser.feed(b"j"), vec![ParsedInput::Char('j')]);
     }
 
     #[test]
@@ -1288,48 +1526,64 @@ mod tests {
 
     #[test]
     fn split_alt_enter_returns_plain_bytes_when_no_trigger() {
-        let chunks = split_alt_enter(b"hello");
-        assert_eq!(chunks, vec![AltEnterChunk::Bytes(b"hello")]);
+        let chunks = split_escaped_input(b"hello");
+        assert_eq!(chunks, vec![EscapedInputChunk::Bytes(b"hello")]);
     }
 
     #[test]
-    fn split_alt_enter_splits_on_inline_escape_cr() {
-        let chunks = split_alt_enter(b"ab\x1b\rcd");
+    fn split_escaped_input_splits_on_inline_escape_cr() {
+        let chunks = split_escaped_input(b"ab\x1b\rcd");
         assert_eq!(
             chunks,
             vec![
-                AltEnterChunk::Bytes(b"ab"),
-                AltEnterChunk::AltEnter,
-                AltEnterChunk::Bytes(b"cd"),
+                EscapedInputChunk::Bytes(b"ab"),
+                EscapedInputChunk::Event(ParsedInput::AltEnter),
+                EscapedInputChunk::Bytes(b"cd"),
             ]
         );
     }
 
     #[test]
-    fn split_alt_enter_handles_escape_lf_variant() {
-        let chunks = split_alt_enter(b"\x1b\n");
-        assert_eq!(chunks, vec![AltEnterChunk::AltEnter]);
+    fn split_escaped_input_handles_escape_lf_variant() {
+        let chunks = split_escaped_input(b"\x1b\n");
+        assert_eq!(
+            chunks,
+            vec![EscapedInputChunk::Event(ParsedInput::AltEnter)]
+        );
     }
 
     #[test]
-    fn split_alt_enter_handles_consecutive_triggers() {
-        let chunks = split_alt_enter(b"\x1b\r\x1b\nx");
+    fn split_escaped_input_handles_escape_backspace_variants() {
+        let chunks = split_escaped_input(b"\x1b\x08\x1b\x7fx");
         assert_eq!(
             chunks,
             vec![
-                AltEnterChunk::AltEnter,
-                AltEnterChunk::AltEnter,
-                AltEnterChunk::Bytes(b"x"),
+                EscapedInputChunk::Event(ParsedInput::CtrlBackspace),
+                EscapedInputChunk::Event(ParsedInput::CtrlBackspace),
+                EscapedInputChunk::Bytes(b"x"),
             ]
         );
     }
 
     #[test]
-    fn split_alt_enter_leaves_trailing_lone_escape_for_pending_logic() {
+    fn split_escaped_input_handles_consecutive_triggers() {
+        let chunks = split_escaped_input(b"\x1b\r\x1b\nx");
+        assert_eq!(
+            chunks,
+            vec![
+                EscapedInputChunk::Event(ParsedInput::AltEnter),
+                EscapedInputChunk::Event(ParsedInput::AltEnter),
+                EscapedInputChunk::Bytes(b"x"),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_escaped_input_leaves_trailing_lone_escape_for_pending_logic() {
         // A bare ESC at the end of the buffer is left in the byte stream so
         // handle()'s trailing-ESC bookkeeping can set pending_escape.
-        let chunks = split_alt_enter(b"ab\x1b");
-        assert_eq!(chunks, vec![AltEnterChunk::Bytes(b"ab\x1b")]);
+        let chunks = split_escaped_input(b"ab\x1b");
+        assert_eq!(chunks, vec![EscapedInputChunk::Bytes(b"ab\x1b")]);
     }
 
     #[test]
@@ -1354,15 +1608,55 @@ mod tests {
     }
 
     #[test]
-    fn vt_parser_emits_utf8_bytes_for_printable_non_ascii() {
+    fn vt_parser_emits_char_for_printable_non_ascii() {
+        let mut parser = VtInputParser::default();
+        assert_eq!(parser.feed("т".as_bytes()), vec![ParsedInput::Char('т')]);
+        assert_eq!(parser.feed("漢".as_bytes()), vec![ParsedInput::Char('漢')]);
+        assert_eq!(parser.feed("ł".as_bytes()), vec![ParsedInput::Char('ł')]);
+    }
+
+    #[test]
+    fn vt_parser_emits_char_for_ascii_printable() {
+        let mut parser = VtInputParser::default();
+        assert_eq!(parser.feed(b"a"), vec![ParsedInput::Char('a')]);
+        assert_eq!(parser.feed(b" "), vec![ParsedInput::Char(' ')]);
+        assert_eq!(parser.feed(b"~"), vec![ParsedInput::Char('~')]);
+    }
+
+    #[test]
+    fn vt_parser_emits_one_char_per_codepoint_for_full_word() {
         let mut parser = VtInputParser::default();
         assert_eq!(
-            parser.feed("ł".as_bytes()),
-            "ł".as_bytes()
-                .iter()
-                .copied()
-                .map(ParsedInput::Byte)
-                .collect::<Vec<_>>()
+            parser.feed("тест".as_bytes()),
+            vec![
+                ParsedInput::Char('т'),
+                ParsedInput::Char('е'),
+                ParsedInput::Char('с'),
+                ParsedInput::Char('т'),
+            ]
+        );
+    }
+
+    #[test]
+    fn vt_parser_preserves_ascii_controls_as_bytes() {
+        let mut parser = VtInputParser::default();
+        assert_eq!(parser.feed(b"\r"), vec![ParsedInput::Byte(b'\r')]);
+        assert_eq!(parser.feed(b"\n"), vec![ParsedInput::Byte(b'\n')]);
+        assert_eq!(parser.feed(b"\x15"), vec![ParsedInput::Byte(0x15)]);
+        assert_eq!(parser.feed(b"\x7f"), vec![ParsedInput::Byte(0x7f)]);
+    }
+
+    #[test]
+    fn vt_parser_interleaves_ascii_and_non_ascii() {
+        let mut parser = VtInputParser::default();
+        assert_eq!(
+            parser.feed("café".as_bytes()),
+            vec![
+                ParsedInput::Char('c'),
+                ParsedInput::Char('a'),
+                ParsedInput::Char('f'),
+                ParsedInput::Char('é'),
+            ]
         );
     }
 
