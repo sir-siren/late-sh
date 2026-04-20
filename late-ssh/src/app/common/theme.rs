@@ -1,5 +1,5 @@
-use std::cell::Cell;
 use ratatui::style::Color;
+use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeKind {
@@ -51,34 +51,41 @@ struct Palette {
 }
 
 pub const OPTIONS: &[ThemeOption] = &[
-    ThemeOption { 
-        kind: ThemeKind::Late, 
-        id: "late", 
-        label: "Late" },
-    ThemeOption { 
-        kind: ThemeKind::Contrast, 
-        id: "contrast", 
-        label: "High Contrast" },
-    ThemeOption { 
-        kind: ThemeKind::Purple, 
-        id: "purple", 
-        label: "Purple Haze" },
-    ThemeOption { 
-        kind: ThemeKind::Mocha, 
-        id: "mocha", 
-        label: "Catppuccin Mocha" },
-    ThemeOption { 
-        kind: ThemeKind::Macchiato, 
-        id: "macchiato", 
-        label: "Catppuccin Macchiato" },
-    ThemeOption { 
-        kind: ThemeKind::Frappe, 
-        id: "frappe", 
-        label: "Catppuccin Frappé" },
-    ThemeOption { 
-        kind: ThemeKind::Latte, 
-        id: "latte", 
-        label: "Catppuccin Latte" },
+    ThemeOption {
+        kind: ThemeKind::Late,
+        id: "late",
+        label: "Late",
+    },
+    ThemeOption {
+        kind: ThemeKind::Contrast,
+        id: "contrast",
+        label: "High Contrast",
+    },
+    ThemeOption {
+        kind: ThemeKind::Purple,
+        id: "purple",
+        label: "Purple Haze",
+    },
+    ThemeOption {
+        kind: ThemeKind::Mocha,
+        id: "mocha",
+        label: "Catppuccin Mocha",
+    },
+    ThemeOption {
+        kind: ThemeKind::Macchiato,
+        id: "macchiato",
+        label: "Catppuccin Macchiato",
+    },
+    ThemeOption {
+        kind: ThemeKind::Frappe,
+        id: "frappe",
+        label: "Catppuccin Frappé",
+    },
+    ThemeOption {
+        kind: ThemeKind::Latte,
+        id: "latte",
+        label: "Catppuccin Latte",
+    },
 ];
 
 const PALETTE_LATE: Palette = Palette {
