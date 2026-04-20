@@ -3,7 +3,7 @@
   "uid": "observability",
   "title": "Runtime Observability",
   "timezone": "browser",
-  "version": 9,
+  "version": 10,
   "schemaVersion": 39,
   "style": "dark",
   "tags": [
@@ -253,9 +253,9 @@
       }
     },
     {
-      "type": "timeseries",
-      "title": "Log Volume by Service",
-      "description": "Log line count per service, bucketed to the panel's auto step.",
+      "type": "bargauge",
+      "title": "Top INFO Messages",
+      "description": "Most frequent INFO messages - spot noisy logs worth silencing.",
       "datasource": {
         "uid": "victorialogs",
         "type": "victoriametrics-logs-datasource"
@@ -263,41 +263,33 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service.name=~\"$service\"} | stats by (\"service.name\") count() logs",
-          "queryType": "statsRange",
-          "legendFormat": "{{service.name}}"
+          "expr": "{service.name=~\"$service\"} severity:INFO | stats by (\"service.name\", _msg) count() info_logs_total | sort by (info_logs_total desc) | limit 8",
+          "queryType": "stats",
+          "legendFormat": "{{service.name}} - {{_msg}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": {
-            "drawStyle": "bars",
-            "fillOpacity": 70,
-            "lineWidth": 0,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
           },
-          "color": {
-            "mode": "palette-classic"
-          }
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": ["sum"],
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 10
       },
       "gridPos": {
         "h": 8,
@@ -307,9 +299,9 @@
       }
     },
     {
-      "type": "timeseries",
-      "title": "Error Volume by Service",
-      "description": "ERROR-severity log count per service, bucketed to the panel's auto step.",
+      "type": "bargauge",
+      "title": "Top WARN Messages",
+      "description": "Most frequent WARN messages - early warning signal before things escalate.",
       "datasource": {
         "uid": "victorialogs",
         "type": "victoriametrics-logs-datasource"
@@ -317,41 +309,33 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service.name=~\"$service\"} severity:ERROR | stats by (\"service.name\") count() errors",
-          "queryType": "statsRange",
-          "legendFormat": "{{service.name}}"
+          "expr": "{service.name=~\"$service\"} severity:WARN | stats by (\"service.name\", _msg) count() warn_logs_total | sort by (warn_logs_total desc) | limit 8",
+          "queryType": "stats",
+          "legendFormat": "{{service.name}} - {{_msg}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": {
-            "drawStyle": "bars",
-            "fillOpacity": 80,
-            "lineWidth": 0,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              }
+            ]
           },
-          "color": {
-            "mode": "palette-classic"
-          }
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": ["sum"],
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 10
       },
       "gridPos": {
         "h": 8,

@@ -160,6 +160,30 @@ fn composer_title(view: &ComposerBlockView<'_>, block_width: u16) -> String {
     .to_string()
 }
 
+fn empty_composer_placeholder(view: &ComposerBlockView<'_>) -> Paragraph<'static> {
+    let dim = Style::default().fg(theme::TEXT_DIM());
+
+    if view.composing {
+        return Paragraph::new(Line::from(vec![
+            Span::styled(
+                "T",
+                Style::default()
+                    .fg(theme::BG_CANVAS())
+                    .bg(theme::TEXT_DIM()),
+            ),
+            Span::styled("ype a message...", dim),
+        ]));
+    }
+
+    let placeholder_text = if view.selected_message {
+        "1-5 react · r reply · e edit · d delete · p profile · c copy · i compose"
+    } else {
+        "Type a message · j/k select · /help"
+    };
+
+    Paragraph::new(Line::from(Span::styled(placeholder_text, dim)))
+}
+
 pub(super) fn draw_composer_block(frame: &mut Frame, area: Rect, view: &ComposerBlockView<'_>) {
     let composer_title = composer_title(view, area.width);
     let composer_style = if view.composing {
@@ -176,17 +200,8 @@ pub(super) fn draw_composer_block(frame: &mut Frame, area: Rect, view: &Composer
 
     let text_area = horizontal_inset(composer_inner, 1);
 
-    if !view.composing && view.composer.is_empty() && !view.mention_active {
-        let placeholder_text = if view.selected_message {
-            "1-5 react · r reply · e edit · d delete · p profile · c copy · i compose"
-        } else {
-            "Type a message · j/k select · /help"
-        };
-        let placeholder = Paragraph::new(Line::from(Span::styled(
-            placeholder_text,
-            Style::default().fg(theme::TEXT_DIM()),
-        )));
-        frame.render_widget(placeholder, text_area);
+    if view.composer.is_empty() && !view.mention_active {
+        frame.render_widget(empty_composer_placeholder(view), text_area);
     } else {
         frame.render_widget(view.composer, text_area);
     }
@@ -1260,6 +1275,48 @@ mod tests {
                 "title {expected_title:?} truncated at block_w={block_w}: rendered {row:?}",
             );
         }
+    }
+
+    #[test]
+    fn empty_composer_placeholder_is_dim_while_composing() {
+        let ta = TextArea::default();
+        let view = composer_view(&ta);
+        let placeholder = empty_composer_placeholder(&view);
+
+        assert_eq!(placeholder.line_count(80), 1);
+        let line = placeholder
+            .text
+            .lines
+            .first()
+            .expect("placeholder line should exist");
+
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), "T");
+        assert_eq!(line.spans[0].style.fg, Some(theme::BG_CANVAS()));
+        assert_eq!(line.spans[0].style.bg, Some(theme::TEXT_DIM()));
+        assert_eq!(line.spans[1].content.as_ref(), "ype a message...");
+        assert_eq!(line.spans[1].style.fg, Some(theme::TEXT_DIM()));
+    }
+
+    #[test]
+    fn empty_composer_placeholder_uses_hint_text_when_not_composing() {
+        let ta = TextArea::default();
+        let mut view = composer_view(&ta);
+        view.composing = false;
+
+        let placeholder = empty_composer_placeholder(&view);
+        let line = placeholder
+            .text
+            .lines
+            .first()
+            .expect("placeholder line should exist");
+
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(
+            line.spans[0].content.as_ref(),
+            "Type a message · j/k select · /help"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(theme::TEXT_DIM()));
     }
 
     #[test]
