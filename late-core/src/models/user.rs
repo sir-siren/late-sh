@@ -27,7 +27,12 @@ const THEME_ID_KEY: &str = "theme_id";
 const NOTIFY_KINDS_KEY: &str = "notify_kinds";
 const NOTIFY_BELL_KEY: &str = "notify_bell";
 const NOTIFY_COOLDOWN_MINS_KEY: &str = "notify_cooldown_mins";
+const NOTIFY_FORMAT_KEY: &str = "notify_format";
 const ENABLE_BACKGROUND_COLOR_KEY: &str = "enable_background_color";
+const SHOW_DASHBOARD_HEADER_KEY: &str = "show_dashboard_header";
+const SHOW_RIGHT_SIDEBAR_KEY: &str = "show_right_sidebar";
+const SHOW_GAMES_SIDEBAR_KEY: &str = "show_games_sidebar";
+const FAVORITE_ROOM_IDS_KEY: &str = "favorite_room_ids";
 const BIO_KEY: &str = "bio";
 const COUNTRY_KEY: &str = "country";
 const TIMEZONE_KEY: &str = "timezone";
@@ -164,6 +169,11 @@ impl User {
     pub async fn ignored_user_ids(client: &Client, user_id: Uuid) -> Result<Vec<Uuid>> {
         let settings = Self::settings_for_user(client, user_id).await?;
         Ok(extract_ignored_user_ids(&settings))
+    }
+
+    pub async fn favorite_room_ids(client: &Client, user_id: Uuid) -> Result<Vec<Uuid>> {
+        let settings = Self::settings_for_user(client, user_id).await?;
+        Ok(extract_favorite_room_ids(&settings))
     }
 
     pub async fn theme_id(client: &Client, user_id: Uuid) -> Result<Option<String>> {
@@ -316,11 +326,68 @@ pub fn extract_notify_cooldown_mins(settings: &Value) -> i32 {
         .max(0) as i32
 }
 
+/// Valid values: `"both"` (default), `"osc777"`, `"osc9"`. Returns `None`
+/// for missing, empty, or unrecognized values so the caller can fall back
+/// to the default.
+pub fn extract_notify_format(settings: &Value) -> Option<String> {
+    let raw = settings.get(NOTIFY_FORMAT_KEY).and_then(Value::as_str)?;
+    match raw.trim() {
+        "both" | "osc777" | "osc9" => Some(raw.trim().to_string()),
+        _ => None,
+    }
+}
+
 pub fn extract_enable_background_color(settings: &Value) -> bool {
     settings
         .get(ENABLE_BACKGROUND_COLOR_KEY)
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+pub fn extract_show_dashboard_header(settings: &Value) -> bool {
+    settings
+        .get(SHOW_DASHBOARD_HEADER_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub fn extract_show_right_sidebar(settings: &Value) -> bool {
+    settings
+        .get(SHOW_RIGHT_SIDEBAR_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub fn extract_show_games_sidebar(settings: &Value) -> bool {
+    settings
+        .get(SHOW_GAMES_SIDEBAR_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Ordered list of room ids the user has pinned as favorites. Insertion
+/// order is preserved (user-chosen ordering); missing/invalid entries are
+/// dropped silently. Duplicates are collapsed while keeping the first
+/// occurrence so cycling on the dashboard doesn't flicker.
+pub fn extract_favorite_room_ids(settings: &Value) -> Vec<Uuid> {
+    let Some(entries) = settings
+        .get(FAVORITE_ROOM_IDS_KEY)
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(id) = entry.as_str().and_then(|s| Uuid::parse_str(s.trim()).ok()) else {
+            continue;
+        };
+        if seen.insert(id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 pub fn extract_bio(settings: &Value) -> String {
@@ -411,6 +478,42 @@ mod tests {
     fn extract_bio_missing_returns_empty() {
         let settings = json!({});
         assert_eq!(extract_bio(&settings), "");
+    }
+
+    #[test]
+    fn extract_show_right_sidebar_defaults_to_true() {
+        let settings = json!({});
+        assert!(extract_show_right_sidebar(&settings));
+    }
+
+    #[test]
+    fn extract_show_dashboard_header_defaults_to_true() {
+        let settings = json!({});
+        assert!(extract_show_dashboard_header(&settings));
+    }
+
+    #[test]
+    fn extract_show_dashboard_header_reads_explicit_false() {
+        let settings = json!({ "show_dashboard_header": false });
+        assert!(!extract_show_dashboard_header(&settings));
+    }
+
+    #[test]
+    fn extract_show_right_sidebar_reads_explicit_false() {
+        let settings = json!({ "show_right_sidebar": false });
+        assert!(!extract_show_right_sidebar(&settings));
+    }
+
+    #[test]
+    fn extract_show_games_sidebar_defaults_to_true() {
+        let settings = json!({});
+        assert!(extract_show_games_sidebar(&settings));
+    }
+
+    #[test]
+    fn extract_show_games_sidebar_reads_explicit_false() {
+        let settings = json!({ "show_games_sidebar": false });
+        assert!(!extract_show_games_sidebar(&settings));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use late_core::models::{
     chat_message::{ChatMessage, ChatMessageParams},
     chat_room::{ChatRoom, ChatRoomParams},
     chat_room_member::ChatRoomMember,
+    profile::{Profile, ProfileParams},
     user::User,
 };
 use late_ssh::app::chat::notifications::svc::NotificationService;
@@ -110,6 +111,61 @@ async fn emits_message_created_and_send_succeeded_when_sender_is_member() {
     }
     assert!(saw_created, "expected MessageCreated event");
     assert!(saw_success, "expected SendSucceeded event");
+}
+
+#[tokio::test]
+async fn emits_message_reactions_updated_when_member_reacts() {
+    let test_db = new_test_db().await;
+    let service = ChatService::new(
+        test_db.db.clone(),
+        NotificationService::new(test_db.db.clone()),
+    );
+    let mut events = service.subscribe_events();
+    let client = test_db.db.get().await.expect("db client");
+
+    let author = create_test_user(&test_db.db, "author").await;
+    let reactor = create_test_user(&test_db.db, "reactor").await;
+    let room = ChatRoom::get_or_create_language(&client, "en")
+        .await
+        .expect("room");
+    ChatRoomMember::join(&client, room.id, author.id)
+        .await
+        .expect("join author");
+    ChatRoomMember::join(&client, room.id, reactor.id)
+        .await
+        .expect("join reactor");
+    let message = ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: room.id,
+            user_id: author.id,
+            body: "hello".to_string(),
+        },
+    )
+    .await
+    .expect("message");
+
+    service.toggle_message_reaction_task(reactor.id, message.id, 4);
+
+    let event = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("event timeout")
+        .expect("event");
+    match event {
+        ChatEvent::MessageReactionsUpdated {
+            room_id,
+            message_id,
+            reactions,
+            ..
+        } => {
+            assert_eq!(room_id, room.id);
+            assert_eq!(message_id, message.id);
+            assert_eq!(reactions.len(), 1);
+            assert_eq!(reactions[0].kind, 4);
+            assert_eq!(reactions[0].count, 1);
+        }
+        _ => panic!("expected message reactions updated event"),
+    }
 }
 
 #[tokio::test]
@@ -346,6 +402,95 @@ async fn falls_back_to_first_room_when_selected_room_is_none() {
 }
 
 #[tokio::test]
+async fn publishes_snapshot_with_favorite_room_history() {
+    let test_db = new_test_db().await;
+    let service = ChatService::new(
+        test_db.db.clone(),
+        NotificationService::new(test_db.db.clone()),
+    );
+    let mut state_rx = service.subscribe_state();
+    let client = test_db.db.get().await.expect("db client");
+
+    let target_user = create_test_user(&test_db.db, "favorite_target").await;
+    let author_user = create_test_user(&test_db.db, "favorite_author").await;
+
+    let general_room = ChatRoom::ensure_general(&client)
+        .await
+        .expect("ensure general room");
+    let favorite_room = ChatRoom::get_or_create_public_room(&client, "favorites")
+        .await
+        .expect("favorite room");
+
+    ChatRoomMember::join(&client, general_room.id, target_user.id)
+        .await
+        .expect("join target general");
+    ChatRoomMember::join(&client, favorite_room.id, target_user.id)
+        .await
+        .expect("join target favorite");
+    ChatRoomMember::join(&client, general_room.id, author_user.id)
+        .await
+        .expect("join author general");
+    ChatRoomMember::join(&client, favorite_room.id, author_user.id)
+        .await
+        .expect("join author favorite");
+
+    ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: favorite_room.id,
+            user_id: author_user.id,
+            body: "favorite backlog".to_string(),
+        },
+    )
+    .await
+    .expect("favorite message");
+
+    Profile::update(
+        &client,
+        target_user.id,
+        ProfileParams {
+            username: "favorite_target".to_string(),
+            bio: String::new(),
+            country: None,
+            timezone: None,
+            notify_kinds: Vec::new(),
+            notify_bell: false,
+            notify_cooldown_mins: 0,
+            notify_format: None,
+            theme_id: Some("late".to_string()),
+            enable_background_color: false,
+            show_dashboard_header: true,
+            show_right_sidebar: true,
+            show_games_sidebar: true,
+            favorite_room_ids: vec![favorite_room.id],
+        },
+    )
+    .await
+    .expect("update favorites");
+
+    service.list_chats_task(target_user.id, Some(general_room.id));
+
+    timeout(Duration::from_secs(2), state_rx.changed())
+        .await
+        .expect("state timeout")
+        .expect("watch changed");
+    let snapshot = state_rx.borrow_and_update().clone();
+
+    let favorite_in_snapshot = snapshot
+        .chat_rooms
+        .iter()
+        .find(|(room, _)| room.id == favorite_room.id)
+        .expect("favorite room present");
+    assert!(
+        favorite_in_snapshot
+            .1
+            .iter()
+            .any(|message| message.body == "favorite backlog"),
+        "favorite room should preload its history in the snapshot"
+    );
+}
+
+#[tokio::test]
 async fn publishes_snapshot_with_persisted_ignored_user_ids() {
     let test_db = new_test_db().await;
     let service = ChatService::new(
@@ -381,6 +526,133 @@ async fn publishes_snapshot_with_persisted_ignored_user_ids() {
     let snapshot = state_rx.borrow_and_update().clone();
 
     assert_eq!(snapshot.ignored_user_ids, vec![ignored_user.id]);
+}
+
+#[tokio::test]
+async fn publishes_snapshot_with_discover_rooms_for_public_rooms_user_has_not_joined() {
+    let test_db = new_test_db().await;
+    let service = ChatService::new(
+        test_db.db.clone(),
+        NotificationService::new(test_db.db.clone()),
+    );
+    let mut state_rx = service.subscribe_state();
+    let client = test_db.db.get().await.expect("db client");
+
+    let target_user = create_test_user(&test_db.db, "discover_target").await;
+    let author_user = create_test_user(&test_db.db, "discover_author").await;
+
+    let general_room = ChatRoom::ensure_general(&client)
+        .await
+        .expect("ensure general room");
+    let discover_room = ChatRoom::get_or_create_public_room(&client, "rust")
+        .await
+        .expect("create discover room");
+    let joined_room = ChatRoom::get_or_create_public_room(&client, "elixir")
+        .await
+        .expect("create joined room");
+
+    ChatRoomMember::join(&client, general_room.id, target_user.id)
+        .await
+        .expect("join target general");
+    ChatRoomMember::join(&client, general_room.id, author_user.id)
+        .await
+        .expect("join author general");
+    ChatRoomMember::join(&client, discover_room.id, author_user.id)
+        .await
+        .expect("join author discover room");
+    ChatRoomMember::join(&client, joined_room.id, target_user.id)
+        .await
+        .expect("join target joined room");
+    ChatRoomMember::join(&client, joined_room.id, author_user.id)
+        .await
+        .expect("join author joined room");
+
+    ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: discover_room.id,
+            user_id: author_user.id,
+            body: "discover-msg".to_string(),
+        },
+    )
+    .await
+    .expect("discover message");
+    ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: joined_room.id,
+            user_id: author_user.id,
+            body: "joined-msg".to_string(),
+        },
+    )
+    .await
+    .expect("joined message");
+
+    service.list_chats_task(target_user.id, Some(general_room.id));
+
+    timeout(Duration::from_secs(2), state_rx.changed())
+        .await
+        .expect("state timeout")
+        .expect("watch changed");
+    let snapshot = state_rx.borrow_and_update().clone();
+
+    assert_eq!(snapshot.discover_rooms.len(), 1);
+    assert_eq!(snapshot.discover_rooms[0].room_id, discover_room.id);
+    assert_eq!(snapshot.discover_rooms[0].slug, "rust");
+    assert_eq!(snapshot.discover_rooms[0].member_count, 1);
+    assert_eq!(snapshot.discover_rooms[0].message_count, 1);
+}
+
+#[tokio::test]
+async fn join_public_room_task_only_adds_requesting_user() {
+    let test_db = new_test_db().await;
+    let service = ChatService::new(
+        test_db.db.clone(),
+        NotificationService::new(test_db.db.clone()),
+    );
+    let mut events = service.subscribe_events();
+    let client = test_db.db.get().await.expect("db client");
+
+    let target_user = create_test_user(&test_db.db, "discover_join_target").await;
+    let existing_member = create_test_user(&test_db.db, "discover_join_existing").await;
+    let untouched_user = create_test_user(&test_db.db, "discover_join_untouched").await;
+    let room = ChatRoom::get_or_create_public_room(&client, "zig")
+        .await
+        .expect("create room");
+
+    ChatRoomMember::join(&client, room.id, existing_member.id)
+        .await
+        .expect("join existing member");
+
+    service.join_public_room_task(target_user.id, room.id, "zig".to_string());
+
+    let event = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("event timeout")
+        .expect("event");
+    match event {
+        ChatEvent::RoomJoined {
+            user_id,
+            room_id,
+            slug,
+        } => {
+            assert_eq!(user_id, target_user.id);
+            assert_eq!(room_id, room.id);
+            assert_eq!(slug, "zig");
+        }
+        other => panic!("expected RoomJoined, got {other:?}"),
+    }
+
+    assert!(
+        ChatRoomMember::is_member(&client, room.id, target_user.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ChatRoomMember::is_member(&client, room.id, untouched_user.id)
+            .await
+            .unwrap()
+    );
 }
 
 // --- delete message: regression tests for user_id on MessageDeleted ---

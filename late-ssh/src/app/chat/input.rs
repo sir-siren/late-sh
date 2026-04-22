@@ -1,4 +1,5 @@
 use crate::app::common::primitives::Banner;
+use crate::app::common::readline::ctrl_byte_to_input;
 use crate::app::help_modal::data::HelpTopic;
 use crate::app::state::App;
 use uuid::Uuid;
@@ -11,7 +12,23 @@ fn is_prev_room_key(byte: u8) -> bool {
     matches!(byte, b'h' | b'H' | 0x10)
 }
 
-pub fn handle_compose_input(app: &mut App, byte: u8) {
+fn leader_reaction_kind(byte: u8) -> Option<i16> {
+    match byte {
+        b'1' => Some(1),
+        b'2' => Some(2),
+        b'3' => Some(3),
+        b'4' => Some(4),
+        b'5' => Some(5),
+        _ => None,
+    }
+}
+
+pub fn handle_compose_input(
+    app: &mut App,
+    byte: u8,
+    allow_room_switch: bool,
+    from_dashboard: bool,
+) {
     if app.chat.is_autocomplete_active() {
         match byte {
             0x1B => {
@@ -29,24 +46,14 @@ pub fn handle_compose_input(app: &mut App, byte: u8) {
     match byte {
         0x1B => app.chat.reset_composer(),
         b'\r' | b'\n' => {
-            if let Some(b) = app.chat.submit_composer(false) {
+            if let Some(b) = app.chat.submit_composer(false, from_dashboard) {
                 app.banner = Some(b);
             }
-            if let Some(topic) = app.chat.take_requested_help_topic() {
-                open_help_modal(app, topic);
-            }
-            if app.chat.take_requested_settings_modal() {
-                open_settings_modal(app);
-            }
+            handle_post_submit_requests(app);
         }
         0x15 => {
-            // Ctrl-U: clear composer
-            app.chat.composer_clear();
-            app.chat.update_autocomplete();
-        }
-        0x19 => {
-            // Ctrl-Y: yank from kill-ring (filled by Alt-D / Ctrl-W word deletes)
-            app.chat.composer_paste();
+            // Readline ^U: kill from cursor to start of current line.
+            app.chat.composer_kill_to_head();
             app.chat.update_autocomplete();
         }
         0x1F => {
@@ -58,7 +65,34 @@ pub fn handle_compose_input(app: &mut App, byte: u8) {
             app.chat.composer_backspace();
             app.chat.update_autocomplete();
         }
-        _ => {}
+        // ^N / ^P switch to the next/previous room without losing the
+        // in-progress draft — useful when you start typing and realize you
+        // meant to be in another room. Reply/edit targets are dropped on
+        // the jump (they point at a message in the prior room); composer
+        // text and cursor survive. Shadows ratatui-textarea's cursor-
+        // down/up, which is rarely useful in a chat composer.
+        0x0E if allow_room_switch => {
+            if app.chat.switch_room_preserving_draft(1) {
+                app.sync_visible_chat_room();
+            }
+            app.chat.update_autocomplete();
+        }
+        0x10 if allow_room_switch => {
+            if app.chat.switch_room_preserving_draft(-1) {
+                app.sync_visible_chat_room();
+            }
+            app.chat.update_autocomplete();
+        }
+        b => {
+            // Hand remaining Ctrl+<letter> chords to ratatui-textarea so its
+            // built-in emacs keymap owns ^A/^E/^K/^Y/^F/^B/etc. ^W and ^H
+            // are intercepted earlier in app::input for delete-word-left
+            // and don't reach this point.
+            if let Some(input) = ctrl_byte_to_input(b) {
+                app.chat.composer_input(input);
+                app.chat.update_autocomplete();
+            }
+        }
     }
 }
 
@@ -70,9 +104,22 @@ fn open_help_modal(app: &mut App, topic: HelpTopic) {
 fn open_settings_modal(app: &mut App) {
     app.settings_modal_state.open_from_profile(
         app.profile_state.profile(),
+        app.chat.favorite_room_options(),
         crate::app::settings_modal::ui::MODAL_WIDTH,
     );
     app.show_settings = true;
+}
+
+pub(crate) fn handle_post_submit_requests(app: &mut App) {
+    if app.chat.take_requested_quit() {
+        crate::app::input::trigger_global_quit(app);
+    }
+    if let Some(topic) = app.chat.take_requested_help_topic() {
+        open_help_modal(app, topic);
+    }
+    if app.chat.take_requested_settings_modal() {
+        open_settings_modal(app);
+    }
 }
 
 pub fn handle_compose_char(app: &mut App, ch: char) {
@@ -102,7 +149,7 @@ pub fn handle_scroll_in_room(app: &mut App, room_id: Uuid, delta: isize) {
 fn switch_room(app: &mut App, delta: isize) {
     if app.chat.move_selection(delta) {
         app.chat.reset_composer();
-        app.chat.mark_selected_room_read();
+        app.sync_visible_chat_room();
         app.chat.request_list();
     }
 }
@@ -120,12 +167,24 @@ pub fn handle_message_action(app: &mut App, byte: u8) -> bool {
 }
 
 pub fn handle_message_action_in_room(app: &mut App, room_id: Uuid, byte: u8) -> bool {
+    if app.chat.is_reaction_leader_active() {
+        if let Some(kind) = leader_reaction_kind(byte) {
+            if let Some(banner) = app.chat.react_to_selected_message_in_room(room_id, kind) {
+                app.banner = Some(banner);
+            }
+            return true;
+        }
+        app.chat.cancel_reaction_leader();
+        return true;
+    }
+
     // `d` deletes and keeps the cursor on the adjacent message so you can
     // reap a run of your own messages with repeated presses.
     // `r` enters reply mode and drops the selection.
     // `e` enters edit mode and drops the selection.
     // `p` opens a read-only profile modal for the selected author.
     match byte {
+        b'f' | b'F' if app.chat.begin_reaction_leader() => return true,
         b'd' | b'D' => {
             if let Some(b) = app.chat.delete_selected_message_in_room(room_id) {
                 app.banner = Some(b);
@@ -232,8 +291,24 @@ pub fn handle_arrow(app: &mut App, key: u8) -> bool {
         app.chat.cancel_room_jump();
         return true;
     }
+    // Left/Right switch rooms (mirrors h/l). Up/Down stay room-local for
+    // message selection.
+    match key {
+        b'C' => {
+            switch_room(app, 1);
+            return true;
+        }
+        b'D' => {
+            switch_room(app, -1);
+            return true;
+        }
+        _ => {}
+    }
     if app.chat.notifications_selected {
         return super::notifications::input::handle_arrow(app, key);
+    }
+    if app.chat.discover_selected {
+        return super::discover::input::handle_arrow(app, key);
     }
     if app.chat.news_selected {
         return super::news::input::handle_arrow(app, key);
@@ -252,7 +327,7 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
                 let changed = app.chat.handle_room_jump_key(byte);
                 if changed {
                     app.chat.reset_composer();
-                    app.chat.mark_selected_room_read();
+                    app.sync_visible_chat_room();
                     app.chat.request_list();
                 }
                 return true;
@@ -275,6 +350,18 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
             return true;
         }
         return super::notifications::input::handle_byte(app, byte);
+    }
+
+    if app.chat.discover_selected {
+        if is_next_room_key(byte) {
+            switch_room(app, 1);
+            return true;
+        }
+        if is_prev_room_key(byte) {
+            switch_room(app, -1);
+            return true;
+        }
+        return super::discover::input::handle_byte(app, byte);
     }
 
     if app.chat.news_selected {
@@ -328,7 +415,7 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_next_room_key, is_prev_room_key};
+    use super::{is_next_room_key, is_prev_room_key, leader_reaction_kind};
 
     #[test]
     fn next_room_keys_include_ctrl_n() {
@@ -344,5 +431,12 @@ mod tests {
         assert!(is_prev_room_key(b'H'));
         assert!(is_prev_room_key(0x10));
         assert!(!is_prev_room_key(b'l'));
+    }
+
+    #[test]
+    fn leader_reaction_keys_are_plain_digits() {
+        assert_eq!(leader_reaction_kind(b'1'), Some(1));
+        assert_eq!(leader_reaction_kind(b'5'), Some(5));
+        assert_eq!(leader_reaction_kind(b'!'), None);
     }
 }

@@ -62,8 +62,13 @@ async fn edit_profile_emits_saved_event_and_refreshes_snapshot() {
             notify_kinds: Vec::new(),
             notify_bell: false,
             notify_cooldown_mins: 0,
+            notify_format: None,
             theme_id: None,
             enable_background_color: false,
+            show_dashboard_header: false,
+            show_right_sidebar: true,
+            show_games_sidebar: true,
+            favorite_room_ids: Vec::new(),
         },
     );
 
@@ -87,6 +92,7 @@ async fn edit_profile_emits_saved_event_and_refreshes_snapshot() {
         .expect("updated profile");
 
     assert_eq!(updated.username, "night-owl");
+    assert!(!updated.show_dashboard_header);
 }
 
 #[tokio::test]
@@ -117,8 +123,13 @@ async fn edit_profile_normalizes_username_before_persisting() {
             notify_kinds: Vec::new(),
             notify_bell: false,
             notify_cooldown_mins: 0,
+            notify_format: None,
             theme_id: None,
             enable_background_color: false,
+            show_dashboard_header: true,
+            show_right_sidebar: true,
+            show_games_sidebar: true,
+            favorite_room_ids: Vec::new(),
         },
     );
 
@@ -167,8 +178,13 @@ async fn edit_profile_preserves_unrelated_settings_keys() {
             notify_kinds: vec!["dms".to_string()],
             notify_bell: false,
             notify_cooldown_mins: 5,
+            notify_format: None,
             theme_id: None,
             enable_background_color: false,
+            show_dashboard_header: true,
+            show_right_sidebar: true,
+            show_games_sidebar: true,
+            favorite_room_ids: Vec::new(),
         },
     );
 

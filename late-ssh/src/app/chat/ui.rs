@@ -1,4 +1,5 @@
 use late_core::models::chat_message::ChatMessage;
+use late_core::models::chat_message_reaction::ChatMessageReactionSummary;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -22,11 +23,14 @@ use crate::app::common::{
 use late_core::models::leaderboard::BadgeTier;
 
 use super::state::{MentionMatch, ROOM_JUMP_KEYS};
-use super::ui_text::wrap_chat_entry_to_lines;
+use super::ui_text::{reaction_label, wrap_chat_entry_to_lines};
 
-fn contributor_badge_for_username(username: &str) -> Option<&'static str> {
+const REACTION_PICKER_KEYS: [i16; 5] = [1, 2, 3, 4, 5];
+
+fn custom_badge_for_username(username: &str) -> Option<&'static str> {
     match username.trim().to_ascii_lowercase().as_str() {
         "mevanlc" | "yawner" => Some(" 🔧"),
+        "kirii.md" => Some(" 🎨"),
         _ => None,
     }
 }
@@ -40,8 +44,10 @@ pub struct DashboardChatView<'a> {
     pub usernames: &'a HashMap<Uuid, String>,
     pub countries: &'a HashMap<Uuid, String>,
     pub badges: &'a HashMap<Uuid, BadgeTier>,
+    pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
     pub current_user_id: Uuid,
     pub selected_message_id: Option<Uuid>,
+    pub reaction_picker_active: bool,
     pub composer: &'a TextArea<'static>,
     pub composing: bool,
     pub mention_matches: &'a [MentionMatch],
@@ -58,6 +64,7 @@ pub(super) struct ComposerBlockView<'a> {
     pub composer: &'a TextArea<'static>,
     pub composing: bool,
     pub selected_message: bool,
+    pub reaction_picker_active: bool,
     pub reply_author: Option<&'a str>,
     pub is_editing: bool,
     pub mention_active: bool,
@@ -158,6 +165,57 @@ fn composer_title(view: &ComposerBlockView<'_>, block_width: u16) -> String {
     .to_string()
 }
 
+fn reaction_picker_placeholder_lines(dim: Style) -> Vec<Line<'static>> {
+    let mut reaction_spans = Vec::new();
+    for (index, key) in REACTION_PICKER_KEYS.iter().copied().enumerate() {
+        if index > 0 {
+            reaction_spans.push(Span::styled("  ", dim));
+        }
+        reaction_spans.push(Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(theme::AMBER())
+                .add_modifier(Modifier::BOLD),
+        ));
+        reaction_spans.push(Span::styled(" ", dim));
+        reaction_spans.push(Span::styled(reaction_label(key), dim));
+    }
+
+    vec![Line::from(reaction_spans)]
+}
+
+fn empty_composer_placeholder(view: &ComposerBlockView<'_>) -> Paragraph<'static> {
+    let dim = Style::default().fg(theme::TEXT_DIM());
+
+    if view.composing {
+        return Paragraph::new(Line::from(vec![
+            Span::styled(
+                "T",
+                Style::default()
+                    .fg(theme::BG_CANVAS())
+                    .bg(theme::TEXT_DIM()),
+            ),
+            Span::styled("ype a message...", dim),
+        ]));
+    }
+
+    let placeholder = if view.reaction_picker_active {
+        reaction_picker_placeholder_lines(dim)
+    } else if view.selected_message {
+        vec![Line::from(Span::styled(
+            "f react · r reply · e edit · d delete · p profile · c copy · i compose",
+            dim,
+        ))]
+    } else {
+        vec![Line::from(Span::styled(
+            "Type a message · j/k select · /binds · or just ask @bot about anything",
+            dim,
+        ))]
+    };
+
+    Paragraph::new(placeholder)
+}
+
 pub(super) fn draw_composer_block(frame: &mut Frame, area: Rect, view: &ComposerBlockView<'_>) {
     let composer_title = composer_title(view, area.width);
     let composer_style = if view.composing {
@@ -174,17 +232,8 @@ pub(super) fn draw_composer_block(frame: &mut Frame, area: Rect, view: &Composer
 
     let text_area = horizontal_inset(composer_inner, 1);
 
-    if !view.composing && view.composer.is_empty() && !view.mention_active {
-        let placeholder_text = if view.selected_message {
-            "r reply · e edit · d delete · p profile · c copy · i compose"
-        } else {
-            "Type a message · j/k select · /help"
-        };
-        let placeholder = Paragraph::new(Line::from(Span::styled(
-            placeholder_text,
-            Style::default().fg(theme::TEXT_DIM()),
-        )));
-        frame.render_widget(placeholder, text_area);
+    if view.composer.is_empty() && !view.mention_active {
+        frame.render_widget(empty_composer_placeholder(view), text_area);
     } else {
         frame.render_widget(view.composer, text_area);
     }
@@ -209,16 +258,28 @@ fn chat_composer_lines_for_height(textarea: &TextArea<'static>, width: usize) ->
     composer_line_count(&text, width)
 }
 
-pub fn draw_dashboard_chat_card(frame: &mut Frame, area: Rect, view: DashboardChatView<'_>) {
-    let block = Block::default()
-        .title(" Chat ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+fn composer_placeholder_lines(view: &ComposerBlockView<'_>) -> usize {
+    if view.composer.is_empty() && !view.mention_active && view.reaction_picker_active {
+        reaction_picker_placeholder_lines(Style::default()).len()
+    } else {
+        0
+    }
+}
 
-    let composer_text_width = inner.width.saturating_sub(4).max(1) as usize;
-    let total_composer_lines = chat_composer_lines_for_height(view.composer, composer_text_width);
+pub fn draw_dashboard_chat_card(frame: &mut Frame, area: Rect, view: DashboardChatView<'_>) {
+    let composer_text_width = area.width.saturating_sub(2).max(1) as usize;
+    let total_composer_lines = chat_composer_lines_for_height(view.composer, composer_text_width)
+        .max(composer_placeholder_lines(&ComposerBlockView {
+            composer: view.composer,
+            composing: view.composing,
+            selected_message: view.selected_message_id.is_some(),
+            reaction_picker_active: view.reaction_picker_active,
+            reply_author: view.reply_author,
+            is_editing: view.is_editing,
+            mention_active: view.mention_active,
+            mention_matches: view.mention_matches,
+            mention_selected: view.mention_selected,
+        }));
     let visible_composer_lines = total_composer_lines.min(5);
     let composer_height = visible_composer_lines as u16 + 2;
     let layout = Layout::vertical([
@@ -226,7 +287,7 @@ pub fn draw_dashboard_chat_card(frame: &mut Frame, area: Rect, view: DashboardCh
         Constraint::Length(1),
         Constraint::Length(composer_height),
     ])
-    .split(inner);
+    .split(area);
     let messages_area = layout[0];
     let composer_area = Some(layout[2]);
 
@@ -249,6 +310,7 @@ pub fn draw_dashboard_chat_card(frame: &mut Frame, area: Rect, view: DashboardCh
                 countries: view.countries,
                 badges: view.badges,
                 bonsai_glyphs: view.bonsai_glyphs,
+                message_reactions: view.message_reactions,
             },
         );
         lines = visible_chat_rows(view.rows_cache, view.selected_message_id, None, height);
@@ -267,6 +329,7 @@ pub fn draw_dashboard_chat_card(frame: &mut Frame, area: Rect, view: DashboardCh
                 composer: view.composer,
                 composing: view.composing,
                 selected_message: view.selected_message_id.is_some(),
+                reaction_picker_active: view.reaction_picker_active,
                 reply_author: view.reply_author,
                 is_editing: view.is_editing,
                 mention_active: view.mention_active,
@@ -285,6 +348,7 @@ struct ChatRowsContext<'a> {
     countries: &'a HashMap<Uuid, String>,
     badges: &'a HashMap<Uuid, BadgeTier>,
     bonsai_glyphs: &'a HashMap<Uuid, String>,
+    message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
 }
 
 #[derive(Default)]
@@ -319,6 +383,7 @@ fn chat_rows_fingerprint(
             .map(|badge| badge.label())
             .hash(&mut hasher);
         ctx.bonsai_glyphs.get(&msg.user_id).hash(&mut hasher);
+        ctx.message_reactions.get(&msg.id).hash(&mut hasher);
     }
 
     hasher.finish()
@@ -365,7 +430,7 @@ fn ensure_chat_rows_cache(
         } else {
             format_username_with_country(msg.user_id, raw_author, ctx.countries)
         };
-        let contributor_badge = contributor_badge_for_username(raw_author).unwrap_or_default();
+        let contributor_badge = custom_badge_for_username(raw_author).unwrap_or_default();
         let is_bot = raw_author == "bot" || raw_author == "graybeard";
         let badge = if !is_bot {
             ctx.badges.get(&msg.user_id).copied()
@@ -390,6 +455,11 @@ fn ensure_chat_rows_cache(
             .map(|g| format!(" {}", g))
             .unwrap_or_default();
         let prefix = format!("{author}{contributor_badge}{streak_badge}{bonsai_badge}");
+        let reactions = ctx
+            .message_reactions
+            .get(&msg.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
 
         let mentions_us = our_mention
             .as_ref()
@@ -410,6 +480,7 @@ fn ensure_chat_rows_cache(
             body_style,
             mentions_us,
             is_continuation,
+            reactions,
         );
         all_rows.extend(msg_lines);
 
@@ -625,6 +696,8 @@ pub struct ChatRenderInput<'a> {
     pub news_selected: bool,
     pub news_unread_count: i64,
     pub news_view: super::news::ui::ArticleListView<'a>,
+    pub discover_selected: bool,
+    pub discover_view: super::discover::ui::DiscoverListView<'a>,
     pub rows_cache: &'a mut ChatRowsCache,
     pub chat_rooms: &'a [(
         late_core::models::chat_room::ChatRoom,
@@ -634,10 +707,12 @@ pub struct ChatRenderInput<'a> {
     pub usernames: &'a HashMap<Uuid, String>,
     pub countries: &'a HashMap<Uuid, String>,
     pub badges: &'a HashMap<Uuid, BadgeTier>,
+    pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
     pub unread_counts: &'a HashMap<Uuid, i64>,
     pub selected_room_id: Option<Uuid>,
     pub room_jump_active: bool,
     pub selected_message_id: Option<Uuid>,
+    pub reaction_picker_active: bool,
     pub highlighted_message_id: Option<Uuid>,
     pub composer: &'a TextArea<'static>,
     pub composing: bool,
@@ -680,33 +755,39 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
     let composing = view.composing;
     let current_user_id = view.current_user_id;
     let news_selected = view.news_selected;
-    let block = Block::default()
-        .title(" Chat ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     if chat_rooms.is_empty() {
         let empty = Paragraph::new("No chat rooms yet.")
             .style(Style::default().fg(theme::TEXT_DIM()))
             .centered();
-        frame.render_widget(empty, inner);
+        frame.render_widget(empty, area);
         return;
     }
 
-    let composer_text_width = inner.width.saturating_sub(4).max(1) as usize;
-    let total_composer_lines = if view.notifications_selected {
+    let composer_text_width = area.width.saturating_sub(2).max(1) as usize;
+    let total_composer_lines = if view.notifications_selected || view.discover_selected {
         1
     } else if news_selected {
         chat_composer_lines_for_height(view.news_composer, composer_text_width)
     } else {
-        chat_composer_lines_for_height(composer, composer_text_width)
+        chat_composer_lines_for_height(composer, composer_text_width).max(
+            composer_placeholder_lines(&ComposerBlockView {
+                composer,
+                composing,
+                selected_message: view.selected_message_id.is_some(),
+                reaction_picker_active: view.reaction_picker_active,
+                reply_author: view.reply_author,
+                is_editing: view.is_editing,
+                mention_active: view.mention_active,
+                mention_matches: view.mention_matches,
+                mention_selected: view.mention_selected,
+            }),
+        )
     };
     let visible_composer_lines = total_composer_lines.min(5);
     let composer_height = visible_composer_lines as u16 + 2;
     let layout =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(composer_height)]).split(inner);
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(composer_height)]).split(area);
     let body = layout[0];
     let composer_area = layout[1];
     let body_layout = Layout::horizontal([Constraint::Length(26), Constraint::Fill(1)]).split(body);
@@ -757,8 +838,10 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
             .iter()
             .find(|(r, _)| r.permanent && r.slug.as_deref() == Some(slug))
         {
-            let is_selected =
-                !news_selected && !view.notifications_selected && selected_room_id == Some(room.id);
+            let is_selected = !news_selected
+                && !view.notifications_selected
+                && !view.discover_selected
+                && selected_room_id == Some(room.id);
             room_lines.push(room_line(
                 room,
                 slug.to_string(),
@@ -779,8 +862,10 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
             .as_deref()
             .map(str::to_string)
             .unwrap_or_else(|| room.kind.clone());
-        let is_selected =
-            !news_selected && !view.notifications_selected && selected_room_id == Some(room.id);
+        let is_selected = !news_selected
+            && !view.notifications_selected
+            && !view.discover_selected
+            && selected_room_id == Some(room.id);
         room_lines.push(room_line(
             room,
             label,
@@ -841,6 +926,32 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
             selected_row_index = Some(room_lines.len() - 1);
         }
     }
+    // Discover virtual room
+    {
+        let discover_selected = view.discover_selected;
+        let discover_count = view.discover_view.items.len();
+        let prefix = room_jump_prefix(
+            room_jump_active.then(|| jump_keys.next()).flatten(),
+            room_jump_active,
+            discover_selected,
+        );
+        let style = if discover_selected {
+            Style::default()
+                .fg(theme::AMBER())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT())
+        };
+        let label = if discover_count > 0 {
+            format!("{prefix}discover ({discover_count})")
+        } else {
+            format!("{prefix}discover")
+        };
+        room_lines.push(Line::from(Span::styled(label, style)));
+        if discover_selected {
+            selected_row_index = Some(room_lines.len() - 1);
+        }
+    }
 
     // ── Rooms (public visibility, alpha sorted) ──
     let mut public_rooms: Vec<_> = chat_rooms
@@ -857,8 +968,10 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
                 .as_deref()
                 .map(str::to_string)
                 .unwrap_or_else(|| room.kind.clone());
-            let is_selected =
-                !news_selected && !view.notifications_selected && selected_room_id == Some(room.id);
+            let is_selected = !news_selected
+                && !view.notifications_selected
+                && !view.discover_selected
+                && selected_room_id == Some(room.id);
             room_lines.push(room_line(
                 room,
                 label,
@@ -886,8 +999,10 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
                 .as_deref()
                 .map(str::to_string)
                 .unwrap_or_else(|| room.kind.clone());
-            let is_selected =
-                !news_selected && !view.notifications_selected && selected_room_id == Some(room.id);
+            let is_selected = !news_selected
+                && !view.notifications_selected
+                && !view.discover_selected
+                && selected_room_id == Some(room.id);
             room_lines.push(room_line(
                 room,
                 label,
@@ -912,8 +1027,10 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
         room_lines.push(section_divider("DMs", rooms_width));
         for (room, _) in &dm_rooms {
             let label = dm_label(room, current_user_id, usernames, countries);
-            let is_selected =
-                !news_selected && !view.notifications_selected && selected_room_id == Some(room.id);
+            let is_selected = !news_selected
+                && !view.notifications_selected
+                && !view.discover_selected
+                && selected_room_id == Some(room.id);
             room_lines.push(room_line(
                 room,
                 label,
@@ -939,9 +1056,9 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
 
     let rooms_block = Block::default()
         .title(if room_jump_active {
-            " Rooms (h/l) Space/Esc cancel jump "
+            " Rooms · Esc cancel "
         } else {
-            " Rooms (h/l) Space jump "
+            " Rooms · h/l ←→ · Space "
         })
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER()));
@@ -961,6 +1078,8 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
             messages_area,
             &view.notifications_view,
         );
+    } else if view.discover_selected {
+        super::discover::ui::draw_discover_list(frame, messages_area, &view.discover_view);
     } else if news_selected {
         super::news::ui::draw_article_list(frame, messages_area, &view.news_view);
     } else {
@@ -1002,6 +1121,7 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
                         countries,
                         badges: view.badges,
                         bonsai_glyphs: view.bonsai_glyphs,
+                        message_reactions: view.message_reactions,
                     },
                 );
                 let mut lines = visible_chat_rows(
@@ -1051,6 +1171,17 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
         )))
         .block(hint_block);
         frame.render_widget(hint_text, composer_area);
+    } else if view.discover_selected {
+        let hint_block = Block::default()
+            .title(" Discover ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::BORDER()));
+        let hint_text = Paragraph::new(Line::from(Span::styled(
+            " j/k navigate · Enter join room",
+            Style::default().fg(theme::TEXT_DIM()),
+        )))
+        .block(hint_block);
+        frame.render_widget(hint_text, composer_area);
     } else if news_selected {
         if view.news_processing || view.news_composing {
             let (title, border_style) = if view.news_processing {
@@ -1092,6 +1223,7 @@ pub fn draw_chat(frame: &mut Frame, area: Rect, view: ChatRenderInput<'_>) {
                 composer,
                 composing,
                 selected_message: view.selected_message_id.is_some(),
+                reaction_picker_active: view.reaction_picker_active,
                 reply_author: view.reply_author,
                 is_editing: view.is_editing,
                 mention_active: view.mention_active,
@@ -1136,6 +1268,7 @@ mod tests {
             composer: textarea,
             composing: true,
             selected_message: false,
+            reaction_picker_active: false,
             reply_author: None,
             is_editing: false,
             mention_active: false,
@@ -1247,6 +1380,84 @@ mod tests {
                 "title {expected_title:?} truncated at block_w={block_w}: rendered {row:?}",
             );
         }
+    }
+
+    #[test]
+    fn reaction_picker_placeholder_uses_one_line() {
+        let lines = reaction_picker_placeholder_lines(Style::default());
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn draw_composer_block_renders_reaction_picker_in_placeholder() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let ta = TextArea::default();
+        let mut view = composer_view(&ta);
+        view.reaction_picker_active = true;
+        view.composing = false;
+        view.selected_message = true;
+
+        let backend = TestBackend::new(72, 3);
+        let mut terminal = Terminal::new(backend).expect("term");
+
+        terminal
+            .draw(|f| draw_composer_block(f, Rect::new(0, 0, 72, 3), &view))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let row_1: String = (0..72).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert!(
+            row_1.contains("1 👍"),
+            "reaction choices missing from {row_1:?}",
+        );
+    }
+
+    #[test]
+    fn empty_composer_placeholder_is_dim_while_composing() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let ta = TextArea::default();
+        let view = composer_view(&ta);
+        let placeholder = empty_composer_placeholder(&view);
+        let width = 20u16;
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("term");
+
+        terminal
+            .draw(|f| f.render_widget(placeholder, Rect::new(0, 0, width, 1)))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..17).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(rendered, "Type a message...");
+        assert_eq!(buf[(0, 0)].fg, theme::BG_CANVAS());
+        assert_eq!(buf[(0, 0)].bg, theme::TEXT_DIM());
+        assert_eq!(buf[(1, 0)].fg, theme::TEXT_DIM());
+    }
+
+    #[test]
+    fn empty_composer_placeholder_uses_hint_text_when_not_composing() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let ta = TextArea::default();
+        let mut view = composer_view(&ta);
+        view.composing = false;
+
+        let placeholder = empty_composer_placeholder(&view);
+        let expected = "Type a message · j/k select · /binds · or just ask @bot about anything";
+        let width = expected.chars().count() as u16;
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("term");
+
+        terminal
+            .draw(|f| f.render_widget(placeholder, Rect::new(0, 0, width, 1)))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(rendered, expected);
+        assert_eq!(buf[(0, 0)].fg, theme::TEXT_DIM());
     }
 
     #[test]
